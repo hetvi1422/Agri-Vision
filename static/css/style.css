@@ -1108,12 +1108,36 @@ body {
     min-height: 220px; /* More compact */
 }
 
+/* =========================================================
+   Enhanced Interactive Hover Animation
+   Creates stronger depth, floating motion,
+   glowing borders, and immersive UI feedback.
+========================================================= */
+
 .feature-card:hover {
-    transform: translateY(-8px);
-    background: var(--card-bg);
-    box-shadow: var(--hover-shadow);
-    border-color: rgba(46, 139, 87, 0.08);
+    transform:
+        translateY(-18px)
+        scale(1.04);
+
+    background:
+        linear-gradient(
+            145deg,
+            rgba(20, 35, 28, 0.96),
+            rgba(10, 18, 14, 0.98)
+        );
+
+    border-color:
+        rgba(76, 255, 153, 0.35);
+
+    box-shadow:
+        0 25px 60px rgba(0,0,0,0.35),
+        0 0 30px rgba(76,255,153,0.18),
+        0 0 60px rgba(76,255,153,0.08);
+
+    cursor: pointer;
 }
+
+
 
 .feature-icon-wrapper {
     width: 55px; /* Reduced from 70px */
@@ -1127,6 +1151,128 @@ body {
     color: var(--emerald-green);
     margin-bottom: 1.5rem;
     transition: var(--transition-smooth);
+}
+/* =========================================================
+   Floating Icon Hover Animation
+========================================================= */
+
+.feature-card:hover .feature-icon-wrapper {
+    transform:
+        scale(1.15)
+        rotate(6deg);
+
+    box-shadow:
+        0 0 18px rgba(76,255,153,0.25);
+
+    background:
+        rgba(76,255,153,0.12);
+}
+
+/* =========================================================
+   UI Enhancement Module:
+   Precision Farming Interactive Feature Cards
+
+   Purpose:
+   This styling enhancement modernizes the homepage
+   feature-card system by introducing smoother
+   animations, hover transitions, visual elevation,
+   glowing accents, and interactive feedback.
+
+   Improvements Included:
+   - Smooth hover animations
+   - Dynamic elevation effects
+   - Neon accent glow
+   - Animated top border sweep
+   - Icon interaction animations
+   - Better visual hierarchy
+   - Improved futuristic UI consistency
+   - Enhanced user engagement
+
+   These changes improve the overall user experience
+   while maintaining the Agri-Vision futuristic
+   design language.
+========================================================= */
+
+.feature-card {
+    position: relative;
+    overflow: hidden;
+
+    transition:
+        transform 0.4s ease,
+        box-shadow 0.4s ease,
+        border-color 0.4s ease,
+        background 0.4s ease;
+
+    will-change: transform;
+}
+
+/* =========================================================
+   Interactive Hover Effects
+========================================================= */
+
+.feature-card:hover {
+    transform: translateY(-12px) scale(1.02);
+
+    box-shadow:
+        0 20px 45px rgba(0,0,0,0.28),
+        0 0 25px rgba(76,255,153,0.12);
+}
+
+/* =========================================================
+   Animated Accent Border Effect
+========================================================= */
+
+.feature-card::before {
+    content: "";
+
+    position: absolute;
+
+    top: 0;
+    left: -100%;
+
+    width: 100%;
+    height: 4px;
+
+    background: linear-gradient(
+        90deg,
+        transparent,
+        #4cff99,
+        transparent
+    );
+
+    transition: 0.6s ease;
+}
+
+.feature-card:hover::before {
+    left: 100%;
+}
+
+/* =========================================================
+   Feature Icon Animation Effects
+========================================================= */
+
+.feature-card i {
+    transition:
+        transform 0.4s ease,
+        color 0.4s ease;
+}
+
+.feature-card:hover i {
+    transform: scale(1.18) rotate(4deg);
+
+    color: #4cff99;
+}
+
+/* =========================================================
+   Typography Hover Improvements
+========================================================= */
+
+.feature-card h3 {
+    transition: color 0.3s ease;
+}
+
+.feature-card:hover h3 {
+    color: #4cff99;
 }
 
 .feature-card:hover .feature-icon-wrapper {
