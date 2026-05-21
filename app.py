@@ -599,7 +599,6 @@ def api_analyze():
     
     if not is_allowed_image(file.filename):
         return jsonify({'error': 'Invalid file type. Please upload a valid image.'}), 400
-    
     try:
         file_bytes = np.frombuffer(file.read(), np.uint8)
         image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
