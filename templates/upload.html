@@ -175,6 +175,63 @@ function useMyLocation() {
                         <i class="fas fa-magnifying-glass"></i> Start AI Analysis
                     </button>
                 </div>
+                <div id="streamProgressPanel" style="display:none; margin-top:1.5rem;">
+    <div style="
+        background: linear-gradient(135deg, #0c1c27 0%, #043158 100%);
+        border: 1px solid rgba(255,255,255,0.1);
+        border-radius: 16px;
+        padding: 1.5rem 1.75rem;
+        color: white;
+    ">
+        <h4 style="margin:0 0 1.25rem; font-size:1rem; color:#80ffb2;">
+            🔬 Analyzing your crop...
+        </h4>
+ 
+        <!-- Progress bar -->
+        <div style="background:rgba(255,255,255,0.1); border-radius:8px; height:8px; margin-bottom:1.25rem; overflow:hidden;">
+            <div id="streamProgressBar" style="
+                height:100%; width:0%; border-radius:8px;
+                background: linear-gradient(90deg, #80ffb2, #17a2b8);
+                transition: width 0.4s ease;
+            "></div>
+        </div>
+ 
+        <!-- Step checklist -->
+        <div id="streamStepList" style="display:flex; flex-direction:column; gap:0.5rem;">
+            <div class="stream-step" id="step-upload_received"   data-label="File received">⬜ File received</div>
+            <div class="stream-step" id="step-preprocessing"     data-label="Preprocessing image">⬜ Preprocessing image</div>
+            <div class="stream-step" id="step-growth_inference"  data-label="YOLOv8 growth stage detection">⬜ YOLOv8 growth stage detection</div>
+            <div class="stream-step" id="step-disease_inference" data-label="ResNet50 disease classification">⬜ ResNet50 disease classification</div>
+            <div class="stream-step" id="step-recommendations"   data-label="Generating recommendations">⬜ Generating recommendations</div>
+            <div class="stream-step" id="step-complete"          data-label="Complete">⬜ Complete</div>
+                    </div>
+            
+                    <!-- Current status message -->
+                    <p id="streamStatusMsg" style="
+                        margin: 1rem 0 0; font-size:0.82rem;
+                        color:rgba(255,255,255,0.55); font-style:italic;
+                    "></p>
+                </div>
+            </div>
+            
+            <style>
+            .stream-step {
+                font-size: 0.88rem;
+                color: rgba(255,255,255,0.45);
+                padding: 0.3rem 0;
+                transition: color 0.3s ease;
+            }
+            .stream-step.done {
+                color: #80ffb2;
+            }
+            .stream-step.active {
+                color: #ffffff;
+                font-weight: 600;
+            }
+            .stream-step.error-step {
+                color: #ff6b6b;
+            }
+            </style>
             </form>
 
             <div id="loadingOverlay" class="loading-overlay hidden" aria-hidden="true">
@@ -359,11 +416,148 @@ uploadArea.addEventListener('drop', (e) => {
     }
 });
 
-document.querySelector('form').addEventListener('submit', (event) => {
-    const submitButton = document.querySelector('.action-btn');
-    if (submitButton) {
-        submitButton.disabled = true;
-        submitButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Analyzing...';
+document.querySelector('form').addEventListener('submit', async function(event) {
+    event.preventDefault();   // stop normal form submission
+ 
+    const form        = event.target;
+    const submitBtn   = document.querySelector('.action-btn');
+    const panel       = document.getElementById('streamProgressPanel');
+    const progressBar = document.getElementById('streamProgressBar');
+    const statusMsg   = document.getElementById('streamStatusMsg');
+    const loadingOverlay = document.getElementById('loadingOverlay');
+ 
+    // Validate file selected
+    const fileInput = document.getElementById('fileInput');
+    if (!fileInput || !fileInput.files || fileInput.files.length === 0) {
+        alert('Please select a crop image first.');
+        return;
+    }
+ 
+    // Show progress panel, hide submit button
+    panel.style.display = 'block';
+    submitBtn.style.display = 'none';
+    if (loadingOverlay) loadingOverlay.classList.add('hidden');
+ 
+    // Reset all steps
+    document.querySelectorAll('.stream-step').forEach(el => {
+        el.classList.remove('done', 'active', 'error-step');
+        el.textContent = '⬜ ' + el.dataset.label;
+    });
+    progressBar.style.width = '0%';
+    statusMsg.textContent = '';
+ 
+    // Build FormData from the form
+    const formData = new FormData(form);
+ 
+    // Store results payload for redirect
+    let finalPayload = null;
+ 
+    try {
+        const response = await fetch('/api/analyze_stream', {
+            method: 'POST',
+            body: formData,
+        });
+ 
+        if (!response.ok) {
+            throw new Error(`Server error: ${response.status}`);
+        }
+ 
+        const reader  = response.body.getReader();
+        const decoder = new TextDecoder();
+        let   buffer  = '';
+ 
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+ 
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop();   // keep incomplete last line
+ 
+            for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;
+                let parsed;
+                try {
+                    parsed = JSON.parse(line.slice(6));
+                } catch {
+                    continue;
+                }
+ 
+                const { step, progress, message, data } = parsed;
+ 
+                // Update progress bar
+                progressBar.style.width = progress + '%';
+                statusMsg.textContent = message;
+ 
+                if (step === 'error') {
+                    // Mark all active steps as error
+                    document.querySelectorAll('.stream-step.active').forEach(el => {
+                        el.classList.remove('active');
+                        el.classList.add('error-step');
+                        el.textContent = '❌ ' + el.dataset.label;
+                    });
+                    statusMsg.style.color = '#ff6b6b';
+                    progressBar.style.background = '#ff6b6b';
+                    submitBtn.style.display = '';
+                    submitBtn.disabled = false;
+                    submitBtn.innerHTML = '<i class="fas fa-magnifying-glass"></i> Try Again';
+                    return;
+                }
+ 
+                // Mark previous active as done
+                document.querySelectorAll('.stream-step.active').forEach(el => {
+                    el.classList.remove('active');
+                    el.classList.add('done');
+                    el.textContent = '✅ ' + el.dataset.label;
+                });
+ 
+                // Mark current step as active
+                const stepEl = document.getElementById('step-' + step);
+                if (stepEl) {
+                    stepEl.classList.add('active');
+                    stepEl.textContent = '⏳ ' + stepEl.dataset.label;
+                }
+ 
+                // On complete — store payload and redirect via hidden form
+                if (step === 'complete' && data) {
+                    finalPayload = data;
+ 
+                    // Mark complete step as done
+                    if (stepEl) {
+                        stepEl.classList.remove('active');
+                        stepEl.classList.add('done');
+                        stepEl.textContent = '✅ ' + stepEl.dataset.label;
+                    }
+ 
+                    statusMsg.textContent = '✅ Done! Loading results...';
+ 
+                    // Small delay so user sees 100%
+                    await new Promise(r => setTimeout(r, 600));
+ 
+                    // POST the results to /analyze_result for rendering
+                    const resultForm = document.createElement('form');
+                    resultForm.method = 'POST';
+                    resultForm.action = '/analyze_result';
+                    resultForm.style.display = 'none';
+ 
+                    const input = document.createElement('input');
+                    input.type  = 'hidden';
+                    input.name  = 'payload';
+                    input.value = JSON.stringify(finalPayload);
+                    resultForm.appendChild(input);
+ 
+                    document.body.appendChild(resultForm);
+                    resultForm.submit();
+                }
+            }
+        }
+ 
+    } catch (err) {
+        statusMsg.textContent = '❌ Connection error: ' + err.message;
+        statusMsg.style.color = '#ff6b6b';
+        submitBtn.style.display = '';
+        submitBtn.disabled = false;
+        submitBtn.innerHTML = '<i class="fas fa-magnifying-glass"></i> Try Again';
     }
 });
 </script>

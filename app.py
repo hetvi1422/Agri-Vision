@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 from dotenv import load_dotenv
 from flasgger import Swagger
-from flask import Flask, flash, jsonify, redirect, render_template, request, url_for
+from flask import Flask, render_template, request, redirect, flash, url_for, jsonify, Response, stream_with_context
 from jinja2 import Environment, FileSystemLoader
 from PIL import Image
 from services.weather_service import (
@@ -1268,6 +1268,216 @@ def api_weather():
     weather["weather_recommendations"] = generate_weather_recommendations(weather)
     return jsonify({"status": "success", "weather": weather})
 
+@app.route("/api/analyze_stream", methods=["POST"])
+def api_analyze_stream():
+    """
+    SSE streaming endpoint for real-time progress feedback.
+    Emits progress events as each pipeline stage completes.
+    On completion, emits the full results as JSON in the final event.
+    """
+ 
+    def generate():
+        import json as _json
+ 
+        def event(name, progress, message, data=None):
+            """Format a single SSE message."""
+            payload = {"step": name, "progress": progress, "message": message}
+            if data:
+                payload["data"] = data
+            return f"data: {_json.dumps(payload)}\n\n"
+ 
+        # ── Step 1: File received ──────────────────────────────────
+        try:
+            if "file" not in request.files:
+                yield event("error", 0, "No file uploaded.")
+                return
+ 
+            file = request.files["file"]
+            if file.filename == "":
+                yield event("error", 0, "No file selected.")
+                return
+ 
+            yield event("upload_received", 10, "File received successfully.")
+ 
+        except Exception as e:
+            yield event("error", 0, f"File error: {str(e)}")
+            return
+ 
+        # ── Step 2: Preprocessing ──────────────────────────────────
+        try:
+            safe_filename, image, image_rgb = read_uploaded_image(file)
+            compressed_rgb = resize_image(image_rgb, MAX_INFERENCE_DIMENSION)
+            image_b64 = encode_image_for_display(image)
+            img_shape = {"width": image.shape[1], "height": image.shape[0]}
+ 
+            yield event("preprocessing", 25, "Image preprocessed and compressed.")
+ 
+        except Exception as e:
+            yield event("error", 25, f"Preprocessing failed: {str(e)}")
+            return
+ 
+        # ── Step 3: YOLOv8 growth stage inference ─────────────────
+        try:
+            growth = infer_growth_stage(compressed_rgb)
+            yield event("growth_inference", 50, f"Growth stage detected: {growth.get('main_class', 'Unknown')}")
+ 
+        except Exception as e:
+            yield event("error", 50, f"Growth stage inference failed: {str(e)}")
+            return
+ 
+        # ── Step 4: ResNet50 disease classification ────────────────
+        try:
+            disease = infer_disease(compressed_rgb)
+            yield event(
+                "disease_inference", 75,
+                f"Disease classified: {disease.get('predicted_class', 'Unknown')} "
+                f"({round(disease.get('confidence', 0) * 100, 1)}% confidence)"
+            )
+ 
+        except Exception as e:
+            yield event("error", 75, f"Disease classification failed: {str(e)}")
+            return
+ 
+        # ── Step 5: Build results + recommendations ────────────────
+        try:
+            # Check if cotton was detected at all
+            if growth.get("main_class") is None:
+                results = {
+                    "error": "No cotton plant detected",
+                    "disease": None,
+                    "growth": growth,
+                    "recommendations": ["Please upload a valid cotton crop image."]
+                }
+            else:
+                results = {
+                    "disease": disease,
+                    "growth": growth,
+                    "recommendations": generate_recommendations(disease, growth),
+                    "error": None,
+                }
+ 
+            yield event("recommendations", 90, "Recommendations generated.")
+ 
+        except Exception as e:
+            yield event("error", 90, f"Recommendation generation failed: {str(e)}")
+            return
+ 
+        # ── Step 6: Weather + Yield enrichment ────────────────────
+        try:
+            lat = request.form.get("lat", type=float)
+            lon = request.form.get("lon", type=float)
+            city = request.form.get("city", type=str)
+            weather = None
+ 
+            if lat and lon:
+                owm_key = os.getenv("OPENWEATHER_API_KEY")
+                weather = get_weather(lat, lon, owm_key)
+            elif city:
+                geo = geocode_city(city)
+                if geo:
+                    owm_key = os.getenv("OPENWEATHER_API_KEY")
+                    weather = get_weather(geo["lat"], geo["lon"], owm_key)
+ 
+            if weather and results.get("disease") and results.get("growth"):
+                extra_recs = generate_weather_recommendations(weather)
+                results["recommendations"] = (
+                    results.get("recommendations", []) + extra_recs
+                )[:6]
+                results["weather"] = weather
+ 
+            field_acres = request.form.get("field_acres", type=float) or 1.0
+            yield_estimate = None
+            if results.get("disease") and results.get("growth"):
+                from services.yield_service import estimate_yield
+                yield_estimate = estimate_yield(
+                    results["disease"],
+                    results["growth"],
+                    weather,
+                    field_acres,
+                )
+ 
+        except Exception as e:
+            # Weather/yield failures are non-fatal — continue
+            weather = None
+            yield_estimate = None
+            logger.warning(f"Weather/yield enrichment failed: {e}")
+ 
+        # ── Step 7: Complete — emit full results ───────────────────
+        try:
+            complete_payload = {
+                "results":        results,
+                "filename":       safe_filename,
+                "image_b64":      image_b64,
+                "img_shape":      img_shape,
+                "raw_json":       _json.dumps(results, indent=2),
+                "timestamp":      datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "weather":        weather,
+                "yield_estimate": yield_estimate,
+            }
+ 
+            yield event("complete", 100, "Analysis complete!", data=complete_payload)
+ 
+        except Exception as e:
+            yield event("error", 95, f"Failed to finalise results: {str(e)}")
+            return
+ 
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",   # disables Nginx buffering if proxied
+        },
+    )
+
+
+@app.route("/analyze_result", methods=["POST"])
+def analyze_result():
+    """
+    Receives the completed SSE payload from the frontend and renders
+    the results page. Acts as the final step of the streaming flow.
+    """
+    import json as _json
+ 
+    try:
+        raw = request.form.get("payload", "")
+        if not raw:
+            flash("No analysis data received.", "error")
+            return redirect(url_for("analyze"))
+ 
+        payload = _json.loads(raw)
+ 
+        results        = payload.get("results", {})
+        filename       = payload.get("filename", "unknown")
+        image_b64      = payload.get("image_b64", "")
+        img_shape      = payload.get("img_shape", {})
+        raw_json       = payload.get("raw_json", "{}")
+        timestamp      = payload.get("timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        weather        = payload.get("weather")
+        yield_estimate = payload.get("yield_estimate")
+ 
+        # Surface any analysis-level error
+        if results.get("error"):
+            flash(results["error"], "error")
+            return redirect(url_for("analyze"))
+ 
+        return render_template(
+            "results.html",
+            results=results,
+            filename=filename,
+            image_b64=image_b64,
+            img_shape=img_shape,
+            raw_json=raw_json,
+            timestamp=timestamp,
+            weather=weather,
+            yield_estimate=yield_estimate,
+        )
+ 
+    except Exception as e:
+        logger.error(f"analyze_result error: {e}")
+        flash(f"Failed to render results: {str(e)}", "error")
+        return redirect(url_for("analyze"))
+ 
 
 if __name__ == "__main__":
     logger.info("=" * 60)
