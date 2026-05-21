@@ -69,7 +69,7 @@ Agri-Vision uses deep learning and computer vision techniques to:
 - [Dataset Information](#-dataset-information)
 - [Model Information](#-model-information)
 - [Project Structure](#-project-structure)
-- [Setup & Execution](#-project-setup--execution)
+- [Setup & Execution](#-setup--execution)
 - [API Reference](#️-api-reference)
 - [Future Enhancements](#-future-enhancements)
 - [Contributing](#-contributing)
@@ -105,28 +105,19 @@ Agri-Vision uses deep learning and computer vision techniques to:
 ---
 
 ## Dataset Information
+---
+### For Cotton Crop
 The datasets used for training the Growth Stage Prediction and Crop Disease Classification models were sourced from Roboflow.
 
-### Growth Stage Prediction Dataset -
-https://universe.roboflow.com/p-project-ebvkg/cotton-boll-growth-detection/dataset/5
+### Growth Stage Prediction Dataset (For cotton crop)  
+
+https://universe.roboflow.com/p-project-ebvkg/cotton-boll-growth-detection/dataset/5  
+
 *The above dataset is also having appropriate labels for YOLO model training
 
-### Crop Disease Classification Dataset -
+### Crop Disease Classification Dataset (for cotton crop)  
+
 https://universe.roboflow.com/deep-learning-nygzt/cotton-crop-dieases/browse?queryText=&pageSize=50&startingIndex=0&browseQuery=true
-
-## 🔜 Upcoming: Tomato Crop Support
-
-We are actively working on expanding Agri-Vision to support **Tomato crop analysis**. Planned features include:
-
-- 🍅 Tomato disease detection (Early Blight, Late Blight, Septoria Leaf Spot, Tomato Mosaic Virus)
-- 🌱 Tomato growth stage identification (Seedling, Vegetative, Flowering, Fruit development)
-- 📊 Tomato-specific recommendations
-
-**Dataset references for contributors:**
-- [PlantVillage Tomato Dataset](https://www.kaggle.com/datasets/kaustubhb999/tomatoleaf)
-- [Tomato Disease Detection (Roboflow)](https://universe.roboflow.com/search?q=tomato)
-
-> 💡 **Contributors wanted!** If you're interested in helping build tomato crop models, check out issue [#73](https://github.com/neeru24/Agri-Vision/issues/73)
 
 ## Growth Phases Detected
 
@@ -136,7 +127,7 @@ We are actively working on expanding Agri-Vision to support **Tomato crop analys
 - Matured Cotton Boll
 - Split Cotton Boll
 
----
+
 
 ## Health Issues Identified
 
@@ -150,16 +141,52 @@ We are actively working on expanding Agri-Vision to support **Tomato crop analys
 - Target spot
 
 ---
+### For Tomato Crop
+The datasets used for training the Growth Stage Prediction and Crop Disease Classification models were sourced from Roboflow.
 
+### Growth Stage Prediction Dataset (For tomato crop)  
+
+https://www.kaggle.com/datasets/arjunsudheer326/tomato-plant-stages-dataset
+
+
+### Crop Disease Classification Dataset (for tomato crop)  
+
+https://universe.roboflow.com/deep-learning-nygzt/cotton-crop-dieases/browse?queryText=&pageSize=50&startingIndex=0&browseQuery=true
+
+## Growth Phases Detected
+
+- Early Vegetative
+- Flowering initiation
+
+
+
+## Health Issues Identified
+
+- Early Blight
+- Healthy
+- Late blight
+- Leaf miner
+- Leaf mold
+- Mosaic virus
+- Septoria
+- Spider mites
+- Yellow leaf curl virus
+
+---
 # 🤖 Model Information
-
+---
+## For cotton crop
 ## Growth Stage Prediction Model
-Model Used - YOLOv8  
+Model Used - YOLOv8   
+
 Parameters - ~3M  
-Layers - 73
+
+Layers - 73  
+
 
 ## Crop Disease Classification Model
 Model Used - ResNet50  
+
 Parameters - 25.6M
 
 
@@ -167,20 +194,71 @@ Parameters - 25.6M
 Check training curves and result snapshots inside the `results/` directory.
 
 ## Metrics for YOLOv8 (Growth Stage Prediction)
-mAP50 - 60.06%
-mAP95 - 34.8%
-R - 53.8%
-P - 62.7%
-Inference Time - 3.3ms
+mAP50 - 60.06%  
+
+mAP95 - 34.8%  
+
+R - 53.8%  
+
+P - 62.7%  
+
+Inference Time - 3.3ms  
+
 
 
 ## Metrics for ResNet50 (Cotton Crop Disease Classification)
-Accuracy - 99.83%
-Precision - 99.83%
-Recall - 99.83%
-F1 Score - 99.83%
-ROC AUC - 99.98%
+Accuracy - 99.83%  
 
+Precision - 99.83%  
+
+Recall - 99.83%  
+
+F1 Score - 99.83%  
+
+ROC AUC - 99.98%  
+
+
+---
+## For tomato crop
+## Growth Stage Prediction Model
+Model Used - YOLOv8   
+
+Parameters - ~3M  
+
+Layers - 73  
+
+
+## Crop Disease Classification Model
+Model Used - ResNet50  
+
+Parameters - 25.6M
+
+# 📊 Model Results
+Check training curves and result snapshots inside the `results/` directory.
+
+## Metrics for YOLOv8 (Tomato crop disease prediction)
+mAP50 - 95.4%  
+
+mAP95 - 86.2%  
+
+R - 88.5%  
+
+P - 92.3%  
+
+Inference Time - 1.3ms  
+
+
+
+## Metrics for ResNet50 (Cotton Crop growth stage prediction)
+Accuracy - 100%
+
+Precision - 100% 
+
+Recall - 100% 
+
+F1 Score - 100%  
+
+ 
 ---
 
 
@@ -213,34 +291,48 @@ Agri-Vision/
 
 ---
 
-# 🚀 Local Setup & Execution
+# 🚀 Setup & Execution
 
-Follow the steps below to run the project locally.
+There are two ways to run this project: using Docker (Recommended) or setting it up locally with Python.
 
-## 1️⃣ Clone the Repository
+## 🐳 Option A: Run with Docker (Recommended)
+Using Docker is the easiest way to run Agri-Vision as it avoids system dependency issues and automatically sets up the environment.
+
+1. Ensure you have [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed.
+2. Clone the repository and navigate into it:
+   ```bash
+   git clone <repository-url>
+   cd <project-folder>
+   ```
+3. Build and start the container:
+   ```bash
+   docker-compose up --build
+   
+```
+4. Access the web interface at `http://localhost:5000`.
+
+---
+
+## 🐍 Option B: Local Python Setup
+
+If you prefer to run the project natively using Python (requires Python 3.8+):
+
+### 1️⃣ Clone the Repository
 
 ```bash
 git clone <repository-url>
 cd <project-folder>
 ```
 
----
-
-## 2️⃣ Create a `.env` File
+### 2️⃣ Create a `.env` File
 
 Create a `.env` file in the root directory of the project and add your secret key.
-
-### Example
 
 ```env
 SECRET_KEY=your_secret_key_here
 ```
 
-Replace `your_secret_key_here` with your actual secret key.
-
----
-
-## 3️⃣ Install Python Dependencies
+### 3️⃣ Install Python Dependencies
 
 Install all the required Python packages using:
 
@@ -248,21 +340,17 @@ Install all the required Python packages using:
 pip install -r requirements.txt
 ```
 
----
+### 4️⃣ Run the Project
 
-## 4️⃣ Run the Project
-
-Start the application using:
+Start the application explicitly by running:
 
 ```bash
 python app.py
 ```
 
----
+### ✅ Setup Complete
 
-## ✅ Setup Complete
-
-The project should now be running successfully on your local machine.
+The project should now be running successfully on your local machine at `http://localhost:5000`.
 
 ---
 
@@ -274,7 +362,7 @@ The test suite runs programmatically in-memory, requiring no external files or s
 
 ### 1️⃣ Run Unit Tests & Coverage (Simultaneously)
 
-Thanks to the pre-configured [pytest.ini](file:///d:/GITHUB%20LOCAL/Agri-Vision/pytest.ini), you don't need to pass long command line arguments. Running a single command will execute all 28 tests, generate verbose progress, check code coverage, and produce an HTML report automatically:
+Thanks to the pre-configured `pytest.ini`, you don't need to pass long command line arguments. Running a single command will execute all 28 tests, generate verbose progress, check code coverage, and produce an HTML report automatically:
 
 ```bash
 python -m pytest
@@ -288,7 +376,7 @@ tests/test_app.py::test_infer_disease_fallback PASSED                    [  7%]
 tests/test_app.py::test_post_api_analyze_exception PASSED                [100%]
 
 =============================== tests coverage ================================
-Name     Stmts   Miss  Cover   Missing
+Name      Stmts   Miss  Cover   Missing
 --------------------------------------
 app.py     201     22    89%   81-83, 88-90, 159, 406-420
 --------------------------------------
@@ -298,7 +386,7 @@ Coverage HTML written to dir htmlcov
 ============================= 28 passed in 1.06s ==============================
 ```
 
-### 2️⃣ View Interactive HTML Coverage Report
+### 2️⃣ View Interactive HTML Coverage report
 
 When you run the tests, a beautiful interactive HTML coverage report is automatically created in the `htmlcov/` directory.
 
@@ -309,7 +397,7 @@ To visually inspect which lines are covered (in green) and which are missed (in 
 
 ### 3️⃣ Automated Continuous Integration (CI)
 
-A GitHub Actions workflow is fully set up in [.github/workflows/tests.yml](file:///d:/GITHUB%20LOCAL/Agri-Vision/.github/workflows/tests.yml). It will automatically run your entire unit test suite and verify code quality/coverage metrics on every single `push` or `pull_request` to the `main` branch.
+A GitHub Actions workflow is fully set up. It will automatically run your entire unit test suite and verify code quality/coverage metrics on every single `push` or `pull_request` to the `main` branch.
 
 ---
 
