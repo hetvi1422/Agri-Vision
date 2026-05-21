@@ -125,8 +125,6 @@ def infer_disease(image):
         class_idx = int(prediction.item())
         healthy_idx = disease_classes.index("Healthy")  
         health_score = float(probs_np[0][healthy_idx]) * 100
-
-
     else:
         # Demo fallback
         probs_np = np.random.rand(1, len(disease_classes))
@@ -187,7 +185,7 @@ def infer_growth_stage(image):
 
 def generate_recommendations(disease_result, growth_result, weather=None):
     recs = []
- 
+    
     dclass = disease_result["predicted_class"]
     instr_map = {
         "Aphids": [
@@ -224,12 +222,12 @@ def generate_recommendations(disease_result, growth_result, weather=None):
         ]
     }
     recs.extend(instr_map.get(dclass, ["Practice general crop hygiene."]))
- 
+    
     if disease_result["health_score"] < 50:
         recs.append("Consult an agricultural expert urgently for low health score.")
     elif disease_result["health_score"] < 70:
         recs.append("Increase frequency of crop monitoring based on moderate health.")
- 
+    
     gmain = growth_result.get("main_class", None)
     grow_map = {
         "Cotton Blossom": [
@@ -255,13 +253,14 @@ def generate_recommendations(disease_result, growth_result, weather=None):
     }
     if gmain in grow_map:
         recs.extend(grow_map[gmain])
- 
-    # ── NEW: inject weather-aware recommendations ──
+    
+    # NEW: inject weather-aware recommendations
     if weather:
         weather_recs = generate_weather_recommendations(weather)
         recs.extend(weather_recs)
- 
+    
     return recs[:6]  # increased cap slightly to accommodate weather tips
+
 def resize_image(image, max_dim=MAX_INFERENCE_DIMENSION):
     height, width = image.shape[:2]
     if max(height, width) <= max_dim:
@@ -269,7 +268,6 @@ def resize_image(image, max_dim=MAX_INFERENCE_DIMENSION):
     scale = max_dim / float(max(height, width))
     new_size = (int(width * scale), int(height * scale))
     return cv2.resize(image, new_size, interpolation=cv2.INTER_AREA)
-
 
 def analyze_image(image):
     # First detect cotton growth stage
@@ -298,9 +296,6 @@ def analyze_image(image):
             fallback_reason,
             "Disease analysis is still provided, but comparison may be less reliable without a confirmed cotton crop detection."
         ]
-
-        # If the uploaded image clearly has no cotton crop, keep the analysis path but let the UI surface a warning.
-        # Relevance validation is handled separately by the comparison route if no meaningful crop information is present.
 
     return result
 
@@ -427,7 +422,7 @@ def analyze():
             image_b64 = encode_image_for_display(image)
             results = analyze_image(compressed_rgb)
 
-            # ── Weather enrichment ──
+            # Weather enrichment
             lat = request.form.get("lat", type=float)
             lon = request.form.get("lon", type=float)
             city = request.form.get("city", type=str)
@@ -448,7 +443,6 @@ def analyze():
             if results.get("error"):
                 raise ValueError(results["error"])
 
-            # Render UI, pass bounding boxes for JS drawing, raw json, etc
             return render_template(
                 "results.html",
                 results=results,
@@ -595,6 +589,12 @@ def api_analyze():
     file = request.files['file']
     if file.filename == '':
         return jsonify({'error': 'No file selected'}), 400
+    
+    # --- THIS IS THE NEW VALIDATION FIX YOU ARE ADDING ---
+    if not is_allowed_image(file.filename):
+        return jsonify({'error': 'Invalid file type. Please upload a valid image (PNG, JPG, JPEG, GIF).'}), 400
+    # -----------------------------------------------------
+
     try:
         file_bytes = np.frombuffer(file.read(), np.uint8)
         image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
@@ -648,25 +648,25 @@ def api_weather():
     lat = request.args.get("lat", type=float)
     lon = request.args.get("lon", type=float)
     city = request.args.get("city", type=str)
- 
+    
     if city and not (lat and lon):
         geo = geocode_city(city)
         if not geo:
             return jsonify({"error": f"Could not geocode city: {city}"}), 404
         lat, lon = geo["lat"], geo["lon"]
- 
+    
     if lat is None or lon is None:
         return jsonify({"error": "Provide lat & lon, or city"}), 400
- 
+    
     owm_key = os.getenv("OPENWEATHER_API_KEY")
     weather = get_weather(lat, lon, owm_key)
- 
+    
     if not weather:
         return jsonify({"error": "Weather data unavailable"}), 503
- 
+    
     weather["weather_recommendations"] = generate_weather_recommendations(weather)
     return jsonify({"status": "success", "weather": weather})
- 
+    
 
 if __name__ == '__main__':
     logger.info("=" * 60)
@@ -685,3 +685,4 @@ if __name__ == '__main__':
     load_models()
     is_debug = os.getenv("FLASK_DEBUG", "False").lower() in ("true", "1", "t")
     app.run(debug=is_debug, host='0.0.0.0', port=5000)
+    
