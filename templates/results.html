@@ -395,7 +395,10 @@
       {% endif %}
 
       <!-- Footer -->
-      <div style="display:flex; justify-content:flex-end; gap:1rem; margin-top:2rem; margin-bottom:2rem;">
+      <div style="display:flex; justify-content:flex-end; gap:1rem; margin-top:2rem; margin-bottom:2rem; flex-wrap: wrap;">
+        <a href="/analyze" class="upload-btn" style="padding:0.5rem 1.2rem; font-size:0.9rem; text-decoration:none; display:inline-flex; align-items:center; background:var(--emerald-green); color:white; border-radius: 8px;">
+          <i class="fas fa-plus-circle" style="margin-right:0.5rem;"></i> Start New Analysis
+        </a>
         <button onclick="readInsights()" class="upload-btn" style="padding:0.5rem 1rem; font-size:0.9rem; background:var(--secondary-green);">
           <i class="fas fa-volume-up"></i> Voice Assistant
         </button>

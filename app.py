@@ -94,6 +94,7 @@ def load_models():
             resnet_model = torch.load(
                 "models/cotton_crop_disease_classification/full_resnet50_model.pth",
                 map_location=torch.device("cpu"),
+                weights_only=False,
             )
             resnet_model.eval() # Set to eval mode immediately after loading
             logger.info("ResNet50 model loaded successfully")
