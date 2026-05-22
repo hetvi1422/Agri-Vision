@@ -279,6 +279,31 @@ def generate_recommendations(disease_result, growth_result, weather=None):
     return recs[:6]
 
 
+def fetch_weather_for_location(lat=None, lon=None, city=None):
+    if lat is not None and lon is not None:
+        owm_key = os.getenv("OPENWEATHER_API_KEY")
+        return get_weather(lat, lon, owm_key)
+
+    if city:
+        geo = geocode_city(city)
+        if geo:
+            owm_key = os.getenv("OPENWEATHER_API_KEY")
+            return get_weather(geo["lat"], geo["lon"], owm_key)
+
+    return None
+
+
+def enrich_results_with_weather(results, lat=None, lon=None, city=None):
+    weather = fetch_weather_for_location(lat=lat, lon=lon, city=city)
+    if weather and results.get("disease") and results.get("growth"):
+        extra_recs = generate_weather_recommendations(weather)
+        results["recommendations"] = (
+            results.get("recommendations", []) + extra_recs
+        )[:6]
+        results["weather"] = weather
+    return weather
+
+
 def resize_image(image, max_dim=MAX_INFERENCE_DIMENSION):
     height, width = image.shape[:2]
     if max(height, width) <= max_dim:
@@ -455,21 +480,7 @@ def analyze():
             lat = request.form.get("lat", type=float)
             lon = request.form.get("lon", type=float)
             city = request.form.get("city", type=str)
-            weather = None
-            if lat and lon:
-                owm_key = os.getenv("OPENWEATHER_API_KEY")
-                weather = get_weather(lat, lon, owm_key)
-            elif city:
-                geo = geocode_city(city)
-                if geo:
-                    owm_key = os.getenv("OPENWEATHER_API_KEY")
-                    weather = get_weather(geo["lat"], geo["lon"], owm_key)
-            if weather and results.get("disease") and results.get("growth"):
-                extra_recs = generate_weather_recommendations(weather)
-                results["recommendations"] = (
-                    results.get("recommendations", []) + extra_recs
-                )[:6]
-                results["weather"] = weather
+            weather = enrich_results_with_weather(results, lat=lat, lon=lon, city=city)
 
             if results.get("error"):
                 raise ValueError(results["error"])
@@ -655,6 +666,21 @@ def api_analyze():
         type: file
         required: true
         description: Upload the cotton crop image (PNG, JPG, JPEG, GIF) to be analyzed.
+      - name: lat
+        in: formData
+        type: number
+        required: false
+        description: Optional latitude for weather-aware recommendations.
+      - name: lon
+        in: formData
+        type: number
+        required: false
+        description: Optional longitude for weather-aware recommendations.
+      - name: city
+        in: formData
+        type: string
+        required: false
+        description: Optional city for weather-aware recommendations when coordinates are not provided.
     responses:
       200:
         description: Synchronous analysis result returned during tests.
@@ -675,6 +701,9 @@ def api_analyze():
 
     try:
         file_bytes = np.frombuffer(file.read(), np.uint8)
+        lat = request.form.get("lat", type=float)
+        lon = request.form.get("lon", type=float)
+        city = request.form.get("city", type=str)
 
         if is_pytest_mode():
             image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
@@ -684,6 +713,7 @@ def api_analyze():
             image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             compressed_rgb = resize_image(image_rgb, MAX_INFERENCE_DIMENSION)
             results = analyze_image(compressed_rgb)
+            enrich_results_with_weather(results, lat=lat, lon=lon, city=city)
 
             if results.get("error"):
                 return jsonify({"error": results["error"]}), 400
@@ -700,7 +730,7 @@ def api_analyze():
         # pytest/CI from touching Redis when no result backend is available.
         from celery_worker import process_inference_task
 
-        task = process_inference_task.delay(file_bytes.tolist())
+        task = process_inference_task.delay(file_bytes.tolist(), lat, lon, city)
 
         return jsonify(
             {
