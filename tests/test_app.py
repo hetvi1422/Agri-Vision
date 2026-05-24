@@ -80,6 +80,8 @@ def test_preprocess_image_for_resnet():
 
 
 def test_infer_disease_fallback(monkeypatch):
+    monkeypatch.setattr(app.model_manager, "resnet_model", None)
+    monkeypatch.setattr(app.model_manager, "loaded", True)
     monkeypatch.setattr(app, "resnet_model", None)
     dummy_img = np.zeros((100, 100, 3), dtype=np.uint8)
     res = app.infer_disease(dummy_img)
@@ -90,6 +92,8 @@ def test_infer_disease_fallback(monkeypatch):
 
 
 def test_infer_disease_active(monkeypatch):
+    monkeypatch.setattr(app.model_manager, "resnet_model", MockResNetModel())
+    monkeypatch.setattr(app.model_manager, "loaded", True)
     monkeypatch.setattr(app, "resnet_model", MockResNetModel())
     dummy_img = np.zeros((100, 100, 3), dtype=np.uint8)
     res = app.infer_disease(dummy_img)
@@ -99,7 +103,8 @@ def test_infer_disease_active(monkeypatch):
 
 
 def test_infer_growth_stage_fallback(monkeypatch):
-    monkeypatch.setattr(app, "yolo_model", None)
+    monkeypatch.setattr(app.model_manager, "yolo_model", None)
+    monkeypatch.setattr(app.model_manager, "loaded", True)
     dummy_img = np.zeros((100, 100, 3), dtype=np.uint8)
     res = app.infer_growth_stage(dummy_img)
     assert res["main_class"] is None
@@ -108,8 +113,8 @@ def test_infer_growth_stage_fallback(monkeypatch):
 
 
 def test_analyze_image_without_growth_detection(monkeypatch):
-    monkeypatch.setattr(app, "yolo_model", None)
-    monkeypatch.setattr(app, "_models_loaded", True)
+    monkeypatch.setattr(app.model_manager, "yolo_model", None)
+    monkeypatch.setattr(app.model_manager, "loaded", True)
     dummy_img = np.zeros((100, 100, 3), dtype=np.uint8)
     result = app.analyze_image(dummy_img)
     assert "disease" in result
@@ -122,7 +127,8 @@ def test_analyze_image_without_growth_detection(monkeypatch):
 
 
 def test_infer_growth_stage_active(monkeypatch):
-    monkeypatch.setattr(app, "yolo_model", MockYOLOModel())
+    monkeypatch.setattr(app.model_manager, "yolo_model", MockYOLOModel())
+    monkeypatch.setattr(app.model_manager, "loaded", True)
     dummy_img = np.zeros((100, 100, 3), dtype=np.uint8)
     res = app.infer_growth_stage(dummy_img)
     assert res["main_class"] == "Matured Cotton Boll"
@@ -186,8 +192,9 @@ def test_set_language_redirect(client):
 
 
 def test_health_check_endpoint(client, monkeypatch):
-    monkeypatch.setattr(app, "resnet_model", MockResNetModel())
-    monkeypatch.setattr(app, "yolo_model", MockYOLOModel())
+    monkeypatch.setattr(app.model_manager, "resnet_model", MockResNetModel())
+    monkeypatch.setattr(app.model_manager, "yolo_model", MockYOLOModel())
+    monkeypatch.setattr(app.model_manager, "loaded", True)
     resp = client.get("/health")
     assert resp.status_code == 200
     data = json.loads(resp.data)
@@ -196,8 +203,9 @@ def test_health_check_endpoint(client, monkeypatch):
 
 
 def test_health_check_endpoint_fallback(client, monkeypatch):
-    monkeypatch.setattr(app, "resnet_model", None)
-    monkeypatch.setattr(app, "yolo_model", None)
+    monkeypatch.setattr(app.model_manager, "resnet_model", None)
+    monkeypatch.setattr(app.model_manager, "yolo_model", None)
+    monkeypatch.setattr(app.model_manager, "loaded", True)
     resp = client.get("/health")
     assert resp.status_code == 200
     data = json.loads(resp.data)
@@ -375,7 +383,8 @@ def test_post_comparison_fallback_when_both_images_no_growth(client, monkeypatch
         }
 
     monkeypatch.setattr(app, "analyze_image", mock_analyze_image)
-    monkeypatch.setattr(app, "yolo_model", object())
+    monkeypatch.setattr(app.model_manager, "yolo_model", object())
+    monkeypatch.setattr(app.model_manager, "loaded", True)
 
     image_one = io.BytesIO()
     Image.new("RGB", (80, 80), color="green").save(image_one, format="PNG")

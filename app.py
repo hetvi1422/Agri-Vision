@@ -34,6 +34,7 @@ from flask import (
     request,
     stream_with_context,
     url_for,
+    Request,
 )
 from flask_cors import CORS
 from PIL import Image
@@ -53,6 +54,12 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
+
+class CustomRequest(Request):
+    max_form_memory_size = 25 * 1024 * 1024  # Support larger base64-encoded forms
+
+app.request_class = CustomRequest
+
 swagger = Swagger(app)
 CORS(app)
 
@@ -64,6 +71,7 @@ app.jinja_env.cache = {}
 secret_key = os.getenv("SECRET_KEY") or "dev_secret_123"
 app.secret_key = secret_key
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
+app.config["MAX_FORM_MEMORY_SIZE"] = 25 * 1024 * 1024
 
 LANG = {
     "en": {"welcome": "Welcome to Agri Vision"},
@@ -309,12 +317,16 @@ def generate_mock_heatmap(image_rgb: np.ndarray) -> np.ndarray:
     return heatmap
 
 
-def apply_heatmap_on_image(image_rgb: np.ndarray, heatmap: np.ndarray, alpha: float = 0.6, beta: float = 0.4) -> np.ndarray:
+def generate_pure_heatmap(image_rgb: np.ndarray, heatmap: np.ndarray) -> np.ndarray:
     h, w, _ = image_rgb.shape
     heatmap_resized = cv2.resize(heatmap, (w, h))
     heatmap_255 = np.uint8(255 * heatmap_resized)
     heatmap_color = cv2.applyColorMap(heatmap_255, cv2.COLORMAP_JET)
-    heatmap_color_rgb = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
+    return cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
+
+
+def apply_heatmap_on_image(image_rgb: np.ndarray, heatmap: np.ndarray, alpha: float = 0.6, beta: float = 0.4) -> np.ndarray:
+    heatmap_color_rgb = generate_pure_heatmap(image_rgb, heatmap)
     return cv2.addWeighted(image_rgb, alpha, heatmap_color_rgb, beta, 0)
 
 
@@ -324,6 +336,7 @@ class GradCAM:
         self.target_layer = target_layer
         self.gradients = None
         self.activations = None
+        self.heatmap_np = None
         self.forward_handle = self.target_layer.register_forward_hook(self._save_activation)
         self.backward_handle = self.target_layer.register_full_backward_hook(self._save_gradient)
         logger.info("Grad-CAM hooks registered on layer: %s", target_layer.__class__.__name__)
@@ -358,8 +371,12 @@ class GradCAM:
         self.model.zero_grad(set_to_none=True)
         self.activations = None
         self.gradients = None
+        self.heatmap_np = None
 
         try:
+            device = next(self.model.parameters()).device
+            input_tensor = input_tensor.to(device)
+
             with torch.enable_grad():
                 output = self.model(input_tensor)
                 if target_class_idx is None:
@@ -384,6 +401,7 @@ class GradCAM:
                     heatmap = heatmap / max_val
 
                 heatmap_np = heatmap.detach().cpu().numpy()
+                self.heatmap_np = heatmap_np
                 return apply_heatmap_on_image(original_image_rgb, heatmap_np)
 
         except Exception as exc:
@@ -663,6 +681,26 @@ def read_uploaded_image(file_storage) -> Tuple[str, np.ndarray, np.ndarray]:
     return safe_filename, image, cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
 
+# -------------------------------------------------------------------
+# THREAD-SAFE GRAD-CAM CACHE
+# -------------------------------------------------------------------
+GRAD_CAM_CACHE = {}
+GRAD_CAM_CACHE_LOCK = threading.Lock()
+MAX_CACHE_SIZE = 100
+
+def get_cached_grad_cam(image_hash: str) -> Optional[Tuple[str, str]]:
+    with GRAD_CAM_CACHE_LOCK:
+        return GRAD_CAM_CACHE.get(image_hash)
+
+def set_cached_grad_cam(image_hash: str, overlay_b64: str, heatmap_only_b64: str) -> None:
+    with GRAD_CAM_CACHE_LOCK:
+        if len(GRAD_CAM_CACHE) >= MAX_CACHE_SIZE:
+            # FIFO eviction
+            first_key = next(iter(GRAD_CAM_CACHE))
+            GRAD_CAM_CACHE.pop(first_key, None)
+        GRAD_CAM_CACHE[image_hash] = (overlay_b64, heatmap_only_b64)
+
+
 def analyze_image(image: np.ndarray) -> Dict[str, Any]:
     resnet_model, yolo_model = model_manager.load_models()
     try:
@@ -676,25 +714,47 @@ def analyze_image(image: np.ndarray) -> Dict[str, Any]:
         if not isinstance(disease, dict) or "predicted_class" not in disease or "health_score" not in disease:
             raise ValueError("Invalid disease model prediction output.")
 
+        # Check cache first
+        image_hash = hashlib.sha256(image.tobytes()).hexdigest()
+        cached_result = get_cached_grad_cam(image_hash)
+        
         grad_cam_image_b64 = None
-        if resnet_model is not None and disease.get("predicted_class_idx") is not None:
-            try:
-                input_tensor = preprocess_image_for_resnet(image)
-                with GradCAM(resnet_model, resnet_model.layer4[-1]) as grad_cam:
-                    grad_cam_overlay = grad_cam(input_tensor, disease["predicted_class_idx"], image)
-                if grad_cam_overlay is not None:
-                    grad_cam_image_b64 = encode_image_for_display(grad_cam_overlay)
-            except Exception as exc:
-                logger.error("Error generating Grad-CAM: %s", exc)
+        heatmap_only_b64 = None
+        
+        if cached_result is not None:
+            grad_cam_image_b64, heatmap_only_b64 = cached_result
+            logger.info("Using cached Grad-CAM heatmaps")
+        else:
+            if resnet_model is not None and disease.get("predicted_class_idx") is not None:
+                try:
+                    input_tensor = preprocess_image_for_resnet(image)
+                    with GradCAM(resnet_model, resnet_model.layer4[-1]) as grad_cam:
+                        grad_cam_overlay = grad_cam(input_tensor, disease["predicted_class_idx"], image)
+                        heatmap_np = getattr(grad_cam, "heatmap_np", None)
+                    if grad_cam_overlay is not None:
+                        grad_cam_image_b64 = encode_image_for_display(grad_cam_overlay)
+                    if heatmap_np is not None:
+                        pure_heatmap_rgb = generate_pure_heatmap(image, heatmap_np)
+                        heatmap_only_b64 = encode_image_for_display(pure_heatmap_rgb)
+                except Exception as exc:
+                    logger.error("Error generating Grad-CAM: %s", exc)
 
-        if grad_cam_image_b64 is None:
-            try:
-                mock_overlay = apply_heatmap_on_image(image, generate_mock_heatmap(image))
-                grad_cam_image_b64 = encode_image_for_display(mock_overlay)
-            except Exception as exc:
-                logger.error("Error generating fallback heatmap: %s", exc)
+            if grad_cam_image_b64 is None or heatmap_only_b64 is None:
+                try:
+                    mock_heatmap = generate_mock_heatmap(image)
+                    mock_overlay = apply_heatmap_on_image(image, mock_heatmap)
+                    grad_cam_image_b64 = encode_image_for_display(mock_overlay)
+                    
+                    pure_heatmap_rgb = generate_pure_heatmap(image, mock_heatmap)
+                    heatmap_only_b64 = encode_image_for_display(pure_heatmap_rgb)
+                except Exception as exc:
+                    logger.error("Error generating fallback heatmap: %s", exc)
+            
+            if grad_cam_image_b64 and heatmap_only_b64:
+                set_cached_grad_cam(image_hash, grad_cam_image_b64, heatmap_only_b64)
 
         disease["heatmap_b64"] = grad_cam_image_b64
+        disease["heatmap_only_b64"] = heatmap_only_b64
 
         recs = generate_recommendations(disease, growth)
         severity = calculate_disease_severity(disease["health_score"])
@@ -707,6 +767,7 @@ def analyze_image(image: np.ndarray) -> Dict[str, Any]:
             "growth": growth,
             "recommendations": recs,
             "grad_cam_image_b64": grad_cam_image_b64,
+            "heatmap_only_b64": heatmap_only_b64,
             "disease_severity": severity,
             "yield_prediction": y_pred,
             "advanced_recommendations": adv_recs,
@@ -917,6 +978,7 @@ def analyze():
                 timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 weather=weather,
                 grad_cam_image_b64=results.get("grad_cam_image_b64"),
+                heatmap_only_b64=results.get("heatmap_only_b64"),
                 disease_info=disease_info,
             )
         except Exception as exc:
@@ -1058,16 +1120,23 @@ def demo():
         cv2.ellipse(synthetic_bgr, (345, 185), (35, 15), 0, 0, 360, (30, 50, 90), -1)
 
         synthetic_rgb = cv2.cvtColor(synthetic_bgr, cv2.COLOR_BGR2RGB)
-        mock_overlay = apply_heatmap_on_image(synthetic_rgb, generate_mock_heatmap(synthetic_rgb))
+        mock_heatmap = generate_mock_heatmap(synthetic_rgb)
+        mock_overlay = apply_heatmap_on_image(synthetic_rgb, mock_heatmap)
+        pure_heatmap_rgb = generate_pure_heatmap(synthetic_rgb, mock_heatmap)
+        
         image_b64 = encode_image_for_display(synthetic_rgb)
         grad_cam_image_b64 = encode_image_for_display(mock_overlay)
+        heatmap_only_b64 = encode_image_for_display(pure_heatmap_rgb)
 
         demo_disease["heatmap_b64"] = grad_cam_image_b64
+        demo_disease["heatmap_only_b64"] = heatmap_only_b64
+        
         example_json = {
             "disease": demo_disease,
             "growth": demo_growth,
             "recommendations": generate_recommendations(demo_disease, demo_growth),
             "grad_cam_image_b64": grad_cam_image_b64,
+            "heatmap_only_b64": heatmap_only_b64,
         }
 
         return render_template(
@@ -1079,6 +1148,7 @@ def demo():
             raw_json=json.dumps(example_json, indent=2),
             timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             grad_cam_image_b64=grad_cam_image_b64,
+            heatmap_only_b64=heatmap_only_b64,
             disease_info=disease_info_map.get("Healthy", {}),
         )
     except Exception as e:
@@ -1177,6 +1247,45 @@ def api_analyze():
         return jsonify({"error": str(exc)}), 500
 
 
+@app.route("/api/explain", methods=["POST"])
+def api_explain():
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+    file = request.files["file"]
+    if file.filename == "":
+        return jsonify({"error": "No file selected"}), 400
+    if not is_allowed_image(file.filename):
+        return jsonify({'error': 'Invalid file type. Please upload a valid image.'}), 400
+
+    try:
+        safe_filename, image, image_rgb = read_uploaded_image(file)
+        compressed_rgb = resize_image(image_rgb, MAX_INFERENCE_DIMENSION)
+        results = analyze_image(compressed_rgb)
+        
+        if results.get("error"):
+            return jsonify({"error": results["error"]}), 400
+            
+        disease = results.get("disease", {})
+        
+        return jsonify({
+            "status": "success",
+            "timestamp": datetime.now().isoformat(),
+            "filename": safe_filename,
+            "predicted_class": disease.get("predicted_class"),
+            "confidence": disease.get("confidence"),
+            "health_score": disease.get("health_score"),
+            "image_b64": encode_image_for_display(image_rgb),
+            "heatmap_b64": results.get("grad_cam_image_b64"),
+            "heatmap_only_b64": results.get("heatmap_only_b64"),
+            "target_layer": "ResNet50 layer4[-1]",
+            "all_confidences": disease.get("all_confidences", {})
+        }), 200
+
+    except Exception as exc:
+        logger.error("API explain error: %s", exc)
+        return jsonify({"error": str(exc)}), 500
+
+
 @app.route("/api/task/<task_id>", methods=["GET"])
 def get_task_status(task_id):
     if is_pytest_mode():
@@ -1252,10 +1361,55 @@ def api_analyze_stream():
             return
 
         try:
+            # Generate Grad-CAM heatmaps for stream
+            grad_cam_image_b64 = None
+            heatmap_only_b64 = None
+            
+            image_hash = hashlib.sha256(compressed_rgb.tobytes()).hexdigest()
+            cached_result = get_cached_grad_cam(image_hash)
+            
+            if cached_result is not None:
+                grad_cam_image_b64, heatmap_only_b64 = cached_result
+                logger.info("Using cached Grad-CAM for stream")
+            else:
+                resnet_model, _ = model_manager.load_models()
+                if resnet_model is not None and disease.get("predicted_class_idx") is not None:
+                    try:
+                        input_tensor = preprocess_image_for_resnet(compressed_rgb)
+                        with GradCAM(resnet_model, resnet_model.layer4[-1]) as grad_cam:
+                            grad_cam_overlay = grad_cam(input_tensor, disease["predicted_class_idx"], compressed_rgb)
+                            heatmap_np = getattr(grad_cam, "heatmap_np", None)
+                        if grad_cam_overlay is not None:
+                            grad_cam_image_b64 = encode_image_for_display(grad_cam_overlay)
+                        if heatmap_np is not None:
+                            pure_heatmap_rgb = generate_pure_heatmap(compressed_rgb, heatmap_np)
+                            heatmap_only_b64 = encode_image_for_display(pure_heatmap_rgb)
+                    except Exception as exc:
+                        logger.error("Error generating Grad-CAM for stream: %s", exc)
+
+                if grad_cam_image_b64 is None or heatmap_only_b64 is None:
+                    try:
+                        mock_heatmap = generate_mock_heatmap(compressed_rgb)
+                        mock_overlay = apply_heatmap_on_image(compressed_rgb, mock_heatmap)
+                        grad_cam_image_b64 = encode_image_for_display(mock_overlay)
+                        
+                        pure_heatmap_rgb = generate_pure_heatmap(compressed_rgb, mock_heatmap)
+                        heatmap_only_b64 = encode_image_for_display(pure_heatmap_rgb)
+                    except Exception as exc:
+                        logger.error("Error generating fallback heatmap for stream: %s", exc)
+                
+                if grad_cam_image_b64 and heatmap_only_b64:
+                    set_cached_grad_cam(image_hash, grad_cam_image_b64, heatmap_only_b64)
+
+            disease["heatmap_b64"] = grad_cam_image_b64
+            disease["heatmap_only_b64"] = heatmap_only_b64
+
             results = {
                 "disease": disease,
                 "growth": growth,
                 "recommendations": generate_recommendations(disease, growth),
+                "grad_cam_image_b64": grad_cam_image_b64,
+                "heatmap_only_b64": heatmap_only_b64,
                 "error": None,
             }
             if growth.get("main_class") is None:
@@ -1300,6 +1454,8 @@ def api_analyze_stream():
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "weather": weather,
                 "yield_estimate": yield_estimate,
+                "grad_cam_image_b64": grad_cam_image_b64,
+                "heatmap_only_b64": heatmap_only_b64,
             }
             yield event("complete", 100, "Analysis complete!", data=complete_payload)
         except Exception as exc:
@@ -1341,6 +1497,8 @@ def analyze_result():
             timestamp=timestamp,
             weather=weather,
             yield_estimate=yield_estimate,
+            grad_cam_image_b64=results.get("grad_cam_image_b64"),
+            heatmap_only_b64=results.get("heatmap_only_b64"),
         )
     except Exception as exc:
         logger.error("analyze_result error: %s", exc)
