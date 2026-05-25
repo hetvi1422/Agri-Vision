@@ -47,6 +47,7 @@ from services.weather_service import (
     geocode_city,
     get_weather,
 )
+from services.yield_service import estimate_yield
 
 load_dotenv()
 
@@ -303,24 +304,6 @@ def resize_image(image: np.ndarray, max_dim: int = MAX_INFERENCE_DIMENSION) -> n
 def calculate_disease_severity(health_score: float) -> float:
     return max(0.0, 100.0 - float(health_score))
 
-
-def predict_yield(health_score: float, growth_stage: str, area_acres: float = 1.0) -> Dict[str, float]:
-    base_yield = 700.0
-    health_factor = float(health_score) / 100.0
-    stage_factors = {
-        "Cotton Blossom": 0.8,
-        "Cotton Bud": 0.9,
-        "Early Boll": 1.0,
-        "Matured Cotton Boll": 1.1,
-        "Split Cotton Boll": 1.0,
-    }
-    g_factor = stage_factors.get(growth_stage, 0.9)
-    estimated_yield = base_yield * health_factor * g_factor * float(area_acres)
-    confidence = min(95.0, 50.0 + (float(health_score) * 0.4))
-    return {
-        "estimated_yield_kg_per_acre": round(estimated_yield, 2),
-        "confidence_percentage": round(confidence, 2),
-    }
 
 
 def generate_mock_heatmap(image_rgb: np.ndarray) -> np.ndarray:
@@ -667,86 +650,6 @@ def generate_advanced_recommendations(disease_result: Dict[str, Any], growth_res
     return adv_recs
 
 
-def analyze_image(image):
-    growth = infer_growth_stage(image)
-    disease = infer_disease(image)
-
-    grad_cam_image_b64 = None
-    # Generate Grad-CAM heatmap if ResNet model and Grad-CAM instance are available
-    # and a valid prediction was made (predicted_class_idx is not None)
-    if resnet_model and grad_cam_instance and disease.get("predicted_class_idx") is not None:
-        try:
-            # Preprocess image for ResNet (ensure it's the same as infer_disease)
-            input_tensor_for_resnet = preprocess_image_for_resnet(image)
-            
-            # Generate Grad-CAM using the instance
-            grad_cam_overlay = grad_cam_instance(
-                input_tensor_for_resnet,
-                disease["predicted_class_idx"],
-                image # Pass the original RGB image (numpy array) for overlay
-            )
-            if grad_cam_overlay is not None:
-                grad_cam_image_b64 = encode_image_for_display(grad_cam_overlay)
-        except Exception as e:
-            logger.error(f"Error generating Grad-CAM: {e}")
-            grad_cam_image_b64 = None
-
-    # Fallback mock heatmap to guarantee XAI availability
-    if grad_cam_image_b64 is None:
-        try:
-            mock_heatmap = generate_mock_heatmap(image)
-            mock_overlay = apply_heatmap_on_image(image, mock_heatmap)
-            grad_cam_image_b64 = encode_image_for_display(mock_overlay)
-            logger.info("Generated high-fidelity fallback mock explainability heatmap.")
-        except Exception as e:
-            logger.error(f"Error generating fallback mock heatmap: {e}")
-
-    # Set both top-level and nested properties for maximum frontend and test compatibility
-    disease["heatmap_b64"] = grad_cam_image_b64
-
-    recs = generate_recommendations(disease, growth)
-    
-    # Calculate severity
-    severity = calculate_disease_severity(disease["health_score"])
-    
-    # Use estimate_yield from service
-    from services.yield_service import estimate_yield
-    yield_est = estimate_yield(disease, growth, weather=None, field_acres=1.0)
-    
-    # Generate advanced recommendations
-    adv_recs = generate_advanced_recommendations(disease, growth)
-    
-    # Generate farmer insights
-    insights = generate_farmer_insights(disease, growth)
-
-    result = {
-        "disease": disease,
-        "growth": growth,
-        "recommendations": recs,
-        "grad_cam_image_b64": grad_cam_image_b64, # Add Grad-CAM to results
-        "disease_severity": severity,
-        "yield_estimate": yield_est, # Rename to yield_estimate for template compatibility
-        "advanced_recommendations": adv_recs,
-        "farmer_insights": insights
-    }
-
-    if growth["main_class"] is None:
-        if yolo_model is None:
-            fallback_reason = "Growth stage model unavailable in this deployment."
-        else:
-            fallback_reason = (
-                "Cotton growth stage could not be detected from the uploaded image."
-            )
-        result["warnings"] = [
-            fallback_reason,
-            "Disease analysis is still provided, but comparison may be less reliable without a confirmed cotton crop detection.",
-            "Grad-CAM explainability may also be affected if the primary crop is not detected." # Add this warning
-        ]
-
-    return result
-
-    return adv_recs
-
 
 def encode_image_for_display(image: np.ndarray) -> str:
     display_image = resize_image(image, DISPLAY_IMAGE_MAX_DIMENSION)
@@ -857,7 +760,7 @@ def analyze_image(image: np.ndarray) -> Dict[str, Any]:
 
         recs = generate_recommendations(disease, growth)
         severity = calculate_disease_severity(disease["health_score"])
-        y_pred = predict_yield(disease["health_score"], growth.get("main_class", "Unknown"))
+        yield_est = estimate_yield(disease, growth, weather=None, field_acres=1.0)
         adv_recs = generate_advanced_recommendations(disease, growth)
         insights = generate_farmer_insights(disease, growth)
 
@@ -868,7 +771,7 @@ def analyze_image(image: np.ndarray) -> Dict[str, Any]:
             "grad_cam_image_b64": grad_cam_image_b64,
             "heatmap_only_b64": heatmap_only_b64,
             "disease_severity": severity,
-            "yield_prediction": y_pred,
+            "yield_estimate": yield_est,
             "advanced_recommendations": adv_recs,
             "farmer_insights": insights,
         }
@@ -1300,15 +1203,52 @@ def api_chat():
 
     message = str(data["message"]).lower()
     responses = {
-        r"\b(hello|hi|hey)\b": ["Hello there! How can I assist you with your cotton crop today?", "Hi! Need any help analyzing your farm data?"],
-        r"\b(disease|sick|spots|rot|blight)\b": ["If you're noticing leaf spots or rotting, it could be Bacterial Blight or Target Spot. I highly recommend taking a picture and uploading it to our Analyze tab for an AI diagnosis."],
-        r"\b(yield|harvest|produce)\b": ["Yield depends heavily on the crop's health score and current growth stage. Check out the Dashboard for predictions across your fields!"],
-        r"\b(fertilizer|nutrient|npk|potassium)\b": ["Cotton responds well to a balanced NPK fertilizer. During the blooming and early boll stages, potassium is critical to maximize yield."],
-        r"\b(water|irrigation|dry)\b": ["Maintain regular watering during the blossom phase. However, once bolls mature and start splitting, you should reduce irrigation to prevent rot."],
-        r"\b(pest|worm|aphid|bug)\b": ["Pests like Pink Bollworm and Aphids are common enemies of cotton. I recommend deploying pheromone traps and scouting the fields twice a week."],
+        r"\b(hello|hi|hey|howdy|greetings)\b": [
+            "Hello there! How can I assist you with your cotton crop today?",
+            "Hi! Need any help analyzing your farm data?"
+        ],
+        r"\b(disease|diseases|sick|spots?|rot|blight)\b": [
+            "If you're noticing leaf spots or rotting, it could be Bacterial Blight or Target Spot. I highly recommend taking a picture and uploading it to our Analyze tab for an AI diagnosis."
+        ],
+        r"\b(yield|yields|harvest|harvests|produce)\b": [
+            "Yield depends heavily on the crop's health score and current growth stage. Check out the Dashboard for predictions across your fields!"
+        ],
+        r"\b(fertilizer|fertilizers|nutrient|nutrients|npk|potassium)\b": [
+            "Cotton responds well to a balanced NPK fertilizer. During the blooming and early boll stages, potassium is critical to maximize yield."
+        ],
+        r"\b(water|watering|irrigation|dry|drought)\b": [
+            "Maintain regular watering during the blossom phase. However, once bolls mature and start splitting, you should reduce irrigation to prevent rot."
+        ],
+        r"\b(pest|pests|worm|worms|aphid|aphids|bug|bugs|insect|insects|bollworm)\b": [
+            "Pests like Pink Bollworm and Aphids are common enemies of cotton. I recommend deploying pheromone traps and scouting the fields twice a week."
+        ],
+        r"\b(weather|temperature|rain|rainfall|humidity|climate)\b": [
+            "Weather plays a huge role in cotton health. Hot, dry spells stress bolls while excess rain can encourage fungal diseases. Use our weather tab to monitor conditions."
+        ],
+        r"\b(soil|soils|ph|minerals|clay|loam|sandy)\b": [
+            "Cotton thrives in well-draining loamy soil with a pH of 5.8–8.0. Conduct a soil test before the season to identify any nutrient deficiencies."
+        ],
+        r"\b(grow|growth|growing|stage|stages|seedling|boll|bolls|flower|flowering)\b": [
+            "Cotton growth has 5 key stages: germination, seedling, vegetative, flowering/boll formation, and maturity. Each stage has unique care needs — the flowering stage is most critical!"
+        ],
+        r"\b(spray|spraying|pesticide|pesticides|fungicide|herbicide|chemical)\b": [
+            "When spraying, always follow label rates and avoid spraying during peak heat or wind. Consider integrated pest management (IPM) to reduce chemical dependency."
+        ],
+        r"\b(thank(?:s|s you)?|awesome|great|perfect)\b": [
+            "You're welcome! Feel free to ask any time. Happy farming! 🌱",
+            "Glad I could help! Let me know if you have more questions about your cotton crop."
+        ],
+        r"\b(help|assist|support|guide|advice|tips?)\b": [
+            "I'm here to help! You can ask me about crop diseases, yield optimization, pest control, irrigation, fertilization, weather impacts, or soil health.",
+            "Sure! Try asking about cotton diseases, pest control, yield estimates, or upload an image in the Analyze tab for an instant AI diagnosis."
+        ],
+        r"\b(cotton|crop|crops|farm|farming|field|fields)\b": [
+            "Agri-Vision specializes in cotton crop analysis. Upload a field image in the Analyze tab for disease detection, yield prediction, and health scoring!"
+        ],
     }
 
     reply = "I'm your Agri-Vision AI assistant. I specialize in cotton farming, crop diseases, and yield optimization. How can I help you?"
+
     for pattern, reply_options in responses.items():
         if re.search(pattern, message):
             reply = random.choice(reply_options)
@@ -1570,7 +1510,7 @@ def api_analyze_stream():
 
             field_acres = request.form.get("field_acres", type=float) or 1.0
             if results.get("disease") and results.get("growth"):
-                yield_estimate = predict_yield(results["disease"]["health_score"], results["growth"].get("main_class", "Unknown"), field_acres)
+                yield_estimate = estimate_yield(results["disease"], results["growth"], weather, field_acres)
         except Exception as exc:
             logger.warning("Weather/yield enrichment failed: %s", exc)
 
