@@ -206,6 +206,54 @@ function useMyLocation() {
                         onchange="previewImage(this)"
                     />
                 </div>
+                <!-- Smart Crop Health Insights Panel -->
+                <div class="smart-insights-panel">
+                    
+                    <div class="insights-header">
+                        <h3>🌿 Smart Crop Health Insights</h3>
+                        <p>AI-powered environmental and crop recommendations</p>
+                    </div>
+                
+                    <div class="insights-grid">
+                    
+                        <!-- Weather Card -->
+                        <div class="insight-card weather-card">
+                            <div class="insight-icon">🌤️</div>
+                            <h4>Weather Status</h4>
+                            <p class="insight-value">28°C Cloudy</p>
+                            <span class="insight-tag good">Good for crop monitoring</span>
+                        </div>
+                    
+                        <!-- Soil Moisture -->
+                        <div class="insight-card moisture-card">
+                            <div class="insight-icon">💧</div>
+                            <h4>Soil Moisture</h4>
+                            <p class="insight-value">Moderate</p>
+                            <span class="insight-tag warning">Irrigation suggested</span>
+                        </div>
+                    
+                        <!-- Disease Risk -->
+                        <div class="insight-card disease-card">
+                            <div class="insight-icon">🦠</div>
+                            <h4>Disease Risk</h4>
+                            <p class="insight-value">Low Risk</p>
+                            <span class="insight-tag success">Healthy condition</span>
+                        </div>
+                    
+                        <!-- Crop Health -->
+                        <div class="insight-card health-card">
+                            <div class="insight-icon">🌱</div>
+                            <h4>Crop Health</h4>
+                        
+                            <div class="health-progress">
+                                <div class="health-progress-bar"></div>
+                            </div>
+                        
+                            <p class="health-score">86% Healthy</p>
+                        </div>
+                    
+                    </div>
+                </div>
                 <div style="margin-top: 3rem;">
                     <button type="submit" class="btn btn-primary btn-large action-btn">
                         <i class="fas fa-magnifying-glass"></i> Start AI Analysis

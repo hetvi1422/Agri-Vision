@@ -293,6 +293,147 @@ body {
 
     transform:translateY(-5px) scale(1.05);
 }
+/* SMART INSIGHTS PANEL */
+
+.smart-insights-panel {
+    margin-top: 2rem;
+    padding: 1.8rem;
+    border-radius: 20px;
+    background: linear-gradient(135deg, #f8fffb 0%, #eefaf2 100%);
+    border: 1px solid rgba(46, 139, 87, 0.15);
+    box-shadow: 0 10px 30px rgba(46, 139, 87, 0.08);
+}
+
+.insights-header {
+    text-align: center;
+    margin-bottom: 1.8rem;
+}
+
+.insights-header h3 {
+    color: var(--emerald-green);
+    font-size: 1.5rem;
+    margin-bottom: 0.4rem;
+}
+
+.insights-header p {
+    opacity: 0.7;
+    font-size: 0.92rem;
+}
+
+.insights-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 1.2rem;
+}
+
+.insight-card {
+    background: white;
+    border-radius: 18px;
+    padding: 1.4rem;
+    text-align: center;
+    transition: all 0.3s ease;
+    border: 1px solid rgba(46, 139, 87, 0.08);
+    box-shadow: 0 6px 16px rgba(0,0,0,0.04);
+}
+
+.insight-card:hover {
+    transform: translateY(-6px);
+    box-shadow: 0 14px 24px rgba(46, 139, 87, 0.12);
+}
+
+.insight-icon {
+    font-size: 2rem;
+    margin-bottom: 0.8rem;
+}
+
+.insight-card h4 {
+    margin-bottom: 0.5rem;
+    color: #1f2937;
+}
+
+.insight-value {
+    font-size: 1rem;
+    font-weight: 600;
+    margin-bottom: 0.7rem;
+    color: var(--emerald-green);
+}
+
+.insight-tag {
+    display: inline-block;
+    padding: 0.4rem 0.8rem;
+    border-radius: 999px;
+    font-size: 0.78rem;
+    font-weight: 600;
+}
+
+.insight-tag.good {
+    background: rgba(59, 130, 246, 0.12);
+    color: #2563eb;
+}
+
+.insight-tag.warning {
+    background: rgba(245, 158, 11, 0.15);
+    color: #d97706;
+}
+
+.insight-tag.success {
+    background: rgba(34, 197, 94, 0.15);
+    color: #15803d;
+}
+
+/* Health Meter */
+
+.health-progress {
+    width: 100%;
+    height: 10px;
+    background: #e5e7eb;
+    border-radius: 999px;
+    overflow: hidden;
+    margin: 1rem 0 0.6rem;
+}
+
+.health-progress-bar {
+    width: 86%;
+    height: 100%;
+    border-radius: 999px;
+    background: linear-gradient(90deg, #22c55e, #16a34a);
+    animation: pulseBar 2s infinite;
+}
+
+.health-score {
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: #15803d;
+}
+
+@keyframes pulseBar {
+    0% {
+        opacity: 0.7;
+    }
+    50% {
+        opacity: 1;
+    }
+    100% {
+        opacity: 0.7;
+    }
+}
+
+/* MOBILE RESPONSIVE */
+
+@media (max-width: 768px) {
+
+    .smart-insights-panel {
+        padding: 1.2rem;
+    }
+
+    .insights-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .insight-card {
+        padding: 1.2rem;
+    }
+}
 @media (min-width: 768px) {
     .col-md-6 {
         flex: 0 0 50%;
