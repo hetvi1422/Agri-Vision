@@ -2819,5 +2819,134 @@ fix-stories-card-alignment
         #6ddc90
     );
     box-shadow: 0 0 15px rgba(93,211,139,0.45);
- main
+    }
+}
+/* Fix 2: Hero container mobile margin */
+@media (max-width: 768px) {
+    .hero-container {
+        margin-left: 0;
+        width: 100%;
+        padding: 0 16px;
+    }
+}
+
+/* Fix 3: Scanner container responsive */
+.scanner-container {
+    max-width: 100%;
+    box-sizing: border-box;
+}
+
+@media (max-width: 768px) {
+    .scanner-container {
+        width: 100%;
+    }
+}
+
+/* Fix 7: Reduce backdrop-filter on mobile */
+@media (max-width: 768px) {
+    .glass-card {
+        backdrop-filter: none;
+        -webkit-backdrop-filter: none;
+        background: rgba(255, 255, 255, 0.85);
+    }
+
+    [data-theme="dark"] .glass-card {
+        background: rgba(22, 27, 33, 0.92);
+    }
+
+    .navbar {
+        backdrop-filter: blur(6px);
+        -webkit-backdrop-filter: blur(6px);
+    }
+}
+
+/* Fix 8: Disable blobs on mobile */
+@media (max-width: 768px) {
+    .blob-1,
+    .blob-2,
+    .blob-3 {
+        display: none;
+    }
+}
+
+/* Mobile Hero Fixes */
+@media (max-width: 768px) {
+
+    /* Fix hero layout to single column */
+    .hero {
+        padding: 6rem 1rem 3rem;
+    }
+
+    .hero-container {
+        margin-left: 0;
+        width: 100%;
+        padding: 0 1rem;
+        grid-template-columns: 1fr;
+        gap: 2rem;
+    }
+
+    /* Fix badge + heading collision */
+    .hero-badge-wrapper {
+        margin-bottom: 0.75rem;
+    }
+
+    .hero-badge {
+        font-size: 0.7rem;
+        padding: 0.4rem 0.9rem;
+        white-space: normal;
+        text-align: center;
+    }
+
+    /* Fix heading size so it doesn't collide */
+    .hero-content h1,
+    .typewriter .line1,
+    .typewriter .line2 {
+        font-size: 1.8rem !important;
+        white-space: normal;
+        overflow: visible;
+        width: auto !important;
+    }
+
+    .typewriter {
+        gap: 4px;
+    }
+
+    /* Fix CTA buttons stacking properly */
+    .hero-cta {
+        flex-direction: column;
+        align-items: center;
+        gap: 0.75rem;
+        width: 100%;
+    }
+
+    .hero-cta .btn {
+        width: 100%;
+        justify-content: center;
+    }
+
+    /* Show the right side (scanner) below content */
+    .hero-image {
+        width: 100%;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+    }
+
+    .scanner-container {
+        width: 100%;
+        height: 260px;
+    }
+
+    /* Fix floating telemetry cards from overflowing */
+    .floating-telemetry-1 {
+        position: static;
+        margin-top: 1rem;
+        width: 100%;
+    }
+
+    .floating-telemetry-2 {
+        position: static;
+        margin-top: 0.75rem;
+        width: 100%;
+    }
 }
