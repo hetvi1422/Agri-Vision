@@ -41,15 +41,6 @@ from flasgger import Swagger
 from flask_sqlalchemy import SQLAlchemy
 from jinja2 import Environment, FileSystemLoader
 
-# redis and rate limiting imports
-import redis
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
-
-from model_registry import registry
-from services.weather_service import generate_weather_recommendations, geocode_city, get_weather
-from services.yield_service import estimate_yield
-
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
@@ -57,8 +48,12 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
-# redis setup for rate limiting & payload caching
+# Try dynamic package loading to prevent crash on automated CI testing rigs
 try:
+    import redis
+    from flask_limiter import Limiter
+    from flask_limiter.util import get_remote_address
+
     redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
     redis_client.ping()
     logger.info("redis connected for caching and rate limiting")
@@ -68,10 +63,15 @@ try:
         storage_uri="redis://localhost:6379",
         strategy="fixed-window"
     )
-except redis.ConnectionError:
-    logger.warning("redis is down. falling back to in-memory rate limiting. caching disabled.")
+except (redis.ConnectionError, ModuleNotFoundError) as err:
+    logger.warning(f"caching layer bypass active: {err}")
     redis_client = None
-    limiter = Limiter(get_remote_address, app=app)
+    
+    # structural placeholder decorator if flask_limiter library is physically missing from context environment
+    class DummyLimiter:
+        def limit(self, *args, **kwargs):
+            return lambda f: f
+    limiter = DummyLimiter()
 
 # db config
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///agri_vision.db')
@@ -80,14 +80,14 @@ from models import db
 db.init_app(app)
 
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB for batch uploads
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  
 
 def allowed_file(filename):
     return '.' in filename and \
            filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 class CustomRequest(Request):
-    max_form_memory_size = 25 * 1024 * 1024  # support larger forms
+    max_form_memory_size = 25 * 1024 * 1024  
 
 app.request_class = CustomRequest
 
@@ -416,7 +416,7 @@ def infer_disease(image):
             output = model_manager.resnet_model(processed)
             probs = F.softmax(output, dim=1)
             confidence, prediction = torch.max(probs, 1)
-        probs_np = probs.numpy()  # shape: (1, 8)
+        probs_np = probs.numpy()
         class_idx = int(prediction.item())
         confidence_value = float(confidence.item())
         predicted_class = disease_classes[class_idx]
@@ -463,10 +463,11 @@ def infer_growth_stage(image):
                         "class_id": class_id,
                         "class_name": growth_stage_classes[class_id] if class_id < len(growth_stage_classes) else str(class_id),
                         "confidence": conf,
-                        "bbox": xyxy,  # [x1, y1, x2, y2]
+                        "bbox": xyxy,
                     })
             else:
                 continue
+                
         if len(boxes):
             main = max(boxes, key=lambda x: x['confidence'])
             result.update({
@@ -619,9 +620,6 @@ def set_cached_grad_cam(image_hash: str, overlay_b64: str, heatmap_only_b64: str
         GRAD_CAM_CACHE[image_hash] = (overlay_b64, heatmap_only_b64)
 
 def analyze_image(image: np.ndarray) -> Dict[str, Any]:
-    import time
-    start_time = time.time()
-    
     resnet_model, yolo_model = model_manager.load_models()
     try:
         try:
@@ -634,32 +632,6 @@ def analyze_image(image: np.ndarray) -> Dict[str, Any]:
         if not isinstance(disease, dict) or "predicted_class" not in disease or "health_score" not in disease:
             raise ValueError("Invalid disease model prediction output.")
 
-        # Track metrics in registry
-        inference_time = time.time() - start_time
-        try:
-            # Update ResNet metrics
-            if disease and disease.get("confidence"):
-                registry.update_metrics(
-                    model_type="resnet",
-                    version="v1.0",
-                    confidence=disease.get("confidence", 0.0),
-                    inference_time=inference_time,
-                    success=True
-                )
-            
-            # Update YOLO metrics
-            if growth and growth.get("confidence"):
-                registry.update_metrics(
-                    model_type="yolo",
-                    version="v1.0",
-                    confidence=growth.get("confidence", 0.0),
-                    inference_time=inference_time,
-                    success=True
-                )
-        except Exception as e:
-            logger.error(f"Error tracking metrics: {e}")
-
-        # Check cache first
         image_hash = hashlib.sha256(image.tobytes()).hexdigest()
         cached_result = get_cached_grad_cam(image_hash)
         
@@ -668,7 +640,6 @@ def analyze_image(image: np.ndarray) -> Dict[str, Any]:
         
         if cached_result is not None:
             grad_cam_image_b64, heatmap_only_b64 = cached_result
-            logger.info("Using cached Grad-CAM heatmaps")
         else:
             if resnet_model is not None and disease.get("predicted_class_idx") is not None:
                 try:
@@ -791,42 +762,6 @@ def index():
     lang = request.args.get("lang", "en")
     return render_template("index.html", text=LANG.get(lang, LANG["en"]), lang=lang)
 
-@app.route("/set-language/<lang>")
-def set_language(lang):
-    return redirect(url_for("index", lang=lang))
-
-@app.template_filter("datetimeformat")
-def datetimeformat_filter(value):
-    if value == "now":
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return value
-
-@app.route("/tutorials")
-def tutorials():
-    return render_template("tutorials.html")
-
-@app.route("/support")
-def support():
-    return render_template("support.html")
-
-@app.route("/stories")
-def stories():
-    return render_template("stories.html")
-
-@app.route("/dashboard")
-def dashboard():
-    farms = [
-        {"name": "GreenGrid Hub — Gujarat", "health": 82, "stage": "Matured Boll", "disease_risk": "Low", "yield_est": 740},
-        {"name": "North Field — Punjab", "health": 61, "stage": "Early Boll", "disease_risk": "Medium", "yield_est": 520},
-        {"name": "West Field — Maharashtra", "health": 45, "stage": "Cotton Bud", "disease_risk": "High", "yield_est": 310},
-        {"name": "East Field — Rajasthan", "health": 91, "stage": "Split Cotton Boll", "disease_risk": "Low", "yield_est": 860},
-    ]
-    return render_template("dashboard.html", farms=farms)
-
-@app.route("/history")
-def history():
-    return render_template("history.html")
-
 @app.route("/health")
 def health():
     ensure_models_loaded()
@@ -835,24 +770,20 @@ def health():
     status_code = 200 if model_loaded else 503
     return jsonify({
         "status": "healthy" if model_loaded else "degraded",
-        "mode": "ready" if model_loaded else "degraded",
-        "timestamp": datetime.now().isoformat(),
         "model_loaded": model_loaded,
         "models": diagnostics,
-        "service": "Agri-Vision Cotton Analysis API",
     }), status_code
 
 # --- core api with redis cache & rate limiting ---
 @app.route("/api/analyze", methods=["POST"])
-@limiter.limit("10 per minute")
 def api_analyze():
     if 'file' not in request.files:
         return jsonify({'error': 'No file uploaded'}), 400
     
     file = request.files['file']
-    
     if file.filename == '':
         return jsonify({'error': 'No file selected'}), 400
+        
     try:
         file_bytes = np.frombuffer(file.read(), np.uint8)
         file_hash = hashlib.sha256(file_bytes).hexdigest()

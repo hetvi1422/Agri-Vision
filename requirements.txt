@@ -38,3 +38,7 @@ flask-sqlalchemy>=3.1.0
 
 # Rate Limiting
 flask-limiter>=3.5.0
+
+# Authentication
+flask-login>=0.6.0
+bcrypt>=4.0.0
