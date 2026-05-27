@@ -145,6 +145,17 @@ class ReportGenerator:
         
         story.append(Spacer(1, 0.3*inch))
         
+        # Key Insights Section (New Feature)
+        insights_header = Paragraph("Key Insights", self.custom_styles['header'])
+        story.append(insights_header)
+        
+        insights = self._generate_key_insights(analysis_data)
+        for insight in insights:
+            insight_para = Paragraph(f"• {insight}", self.custom_styles['body'])
+            story.append(insight_para)
+        
+        story.append(Spacer(1, 0.3*inch))
+        
         # Growth Stage Section
         growth_header = Paragraph("Growth Stage Analysis", self.custom_styles['header'])
         story.append(growth_header)
@@ -202,6 +213,47 @@ class ReportGenerator:
         doc.build(story)
         buffer.seek(0)
         return buffer.getvalue()
+    
+    def _generate_key_insights(self, analysis_data):
+        """Generate key insights based on analysis results"""
+        insights = []
+        
+        disease_result = analysis_data.get('disease_result', {})
+        disease = disease_result.get('predicted_class', 'healthy')
+        health_score = analysis_data.get('health_score', 0)
+        confidence = analysis_data.get('confidence', 0)
+        
+        # Health status insight
+        if health_score >= 80:
+            insights.append("Excellent plant health status detected.")
+        elif health_score >= 60:
+            insights.append("Good plant health with room for improvement.")
+        elif health_score >= 40:
+            insights.append("Moderate health - requires attention.")
+        else:
+            insights.append("Poor health status - immediate action needed.")
+        
+        # Disease insight
+        if disease == 'healthy':
+            insights.append("No disease symptoms detected - continue preventive measures.")
+        else:
+            insights.append(f"Disease identified: {disease.replace('_', ' ').title()} detected.")
+        
+        # Confidence insight
+        if confidence >= 0.9:
+            insights.append("High confidence in analysis results (>90%).")
+        elif confidence >= 0.7:
+            insights.append("Good confidence in analysis results (>70%).")
+        else:
+            insights.append("Moderate confidence - consider re-analysis for confirmation.")
+        
+        # Growth stage insight
+        growth_result = analysis_data.get('growth_result', {})
+        growth_stage = growth_result.get('main_class', '')
+        if growth_stage:
+            insights.append(f"Current growth stage: {growth_stage.replace('_', ' ').title()}.")
+        
+        return insights
     
     def _generate_recommendations(self, analysis_data):
         """Generate recommendations based on analysis results"""
