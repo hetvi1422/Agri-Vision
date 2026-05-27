@@ -813,6 +813,13 @@ document.querySelector('form').addEventListener('submit', async function(event) 
                     statusMsg.style.color = '#ff6b6b';
                     progressBar.style.background = '#ff6b6b';
                     
+                    const previewContainer = document.getElementById('previewContainer');
+                    const preview = document.getElementById('imagePreview');
+
+                    if (previewContainer && preview && preview.src) {
+                        previewContainer.style.display = 'block';
+                        preview.style.display = 'block';
+                    }
                     isAnalyzing = false;
                     submitBtn.style.display = '';
                     submitBtn.disabled = false;
