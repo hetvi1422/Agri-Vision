@@ -5,8 +5,8 @@
     <div class="container" style="padding-bottom: 4rem;">
         <div class="glass-card reveal reveal-fade-up upload-card">
             <div class="section-header" style="margin-bottom: 1.5rem;">
-                <h1 style="font-size: 2rem; margin-bottom: 0.5rem;">📸 Analyze Crop</h1>
-                <p style="font-size: 0.95rem;">Upload a high-resolution image of your cotton crop for instant AI diagnostics.</p>
+                <h1 style="font-size: 2rem; margin-bottom: 0.5rem;" data-i18n="up_title">📸 Analyze Crop</h1>
+                <p style="font-size: 0.95rem;" data-i18n="up_desc">Upload a high-resolution image of your cotton crop for instant AI diagnostics.</p>
             </div>
             
             <form action="/analyze" method="POST" enctype="multipart/form-data">
@@ -17,7 +17,7 @@
                 ">
                     <h4 class="weather-location-title" style="margin: 0 0 0.5rem; font-size: 1rem;">
                         ☁️ Add Location for Weather-Aware Recommendations
-                        <span style="font-weight:400; font-size:0.85rem;">(optional)</span>
+                        <span style="font-weight:400; font-size:0.85rem;" data-i18n="up_loc_opt">(optional)</span>
                     </h4>
                     <p class="weather-location-subtitle" style="margin: 0 0 0.8rem; font-size: 0.85rem;">
                         Type your city or use GPS — we'll fetch live weather for smarter crop advice.
@@ -31,6 +31,7 @@
                                 name="city"
                                 id="city-input"
                                 placeholder="e.g. Nagpur, Maharashtra"
+                                data-i18n="[placeholder]up_loc_placeholder"
                                 autocomplete="off"
                                 oninput="onCityInput(this)"
                                 class="weather-location-input"
