@@ -4,25 +4,27 @@ Unified inference for disease classification (ResNet50) and growth stage predict
 """
 import hashlib
 import logging
-from flask import Flask, render_template, request, jsonify, flash, redirect, url_for, send_file
-from flask_sqlalchemy import SQLAlchemy
-from flask_login import LoginManager, login_user, logout_user, login_required, current_user
 import os
 import random
 import re
 import threading
-from datetime import datetime
+import json
+import base64
+from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Tuple
-from werkzeug.utils import secure_filename
+from collections import defaultdict
 from io import BytesIO
 
-import base64
 import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
+from torchvision import transforms
+from ultralytics import YOLO
+from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
-from flasgger import Swagger
+
 from flask import (
     Flask,
     Response,
@@ -34,13 +36,21 @@ from flask import (
     stream_with_context,
     url_for,
     Request,
+    send_file,
+    make_response
 )
 from flask_cors import CORS
-from PIL import Image
-from torchvision import transforms
-from ultralytics import YOLO
-from werkzeug.utils import secure_filename
+from flasgger import Swagger
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import LoginManager, login_user, logout_user, login_required, current_user
+from jinja2 import Environment, FileSystemLoader
 
+# redis and rate limiting imports
+import redis
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+
+from model_registry import registry
 from services.weather_service import (
     generate_weather_recommendations,
     geocode_city,
@@ -53,11 +63,6 @@ from services.gradcam import (
     generate_pure_heatmap,
 )
 from services.yield_service import estimate_yield
-import json
-from jinja2 import Environment, FileSystemLoader
-from model_registry import registry
-from services.weather_service import generate_weather_recommendations
-from services.yield_service import estimate_yield
 from services.recommendation_engine import get_recommendations as get_treatment_recommendations
 
 load_dotenv()
@@ -67,7 +72,27 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
-# --- Database Configuration ---
+# Try dynamic package loading to prevent crash on automated CI testing rigs
+try:
+    redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+    redis_client.ping()
+    logger.info("redis connected for caching and rate limiting")
+    limiter = Limiter(
+        get_remote_address,
+        app=app,
+        storage_uri="redis://localhost:6379",
+        strategy="fixed-window"
+    )
+except (redis.ConnectionError, ModuleNotFoundError) as err:
+    logger.warning(f"caching layer bypass active: {err}")
+    redis_client = None
+    
+    class DummyLimiter:
+        def limit(self, *args, **kwargs):
+            return lambda f: f
+    limiter = DummyLimiter()
+
+# db config
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///agri_vision.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 from models import db
@@ -87,15 +112,14 @@ def load_user(user_id):
 
 # --- Security Configuration ---
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # Increased to 50MB for batch uploads
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  
 
 def allowed_file(filename):
     return '.' in filename and \
            filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-# ------------------------------
 
 class CustomRequest(Request):
-    max_form_memory_size = 25 * 1024 * 1024  # Support larger base64-encoded forms
+    max_form_memory_size = 25 * 1024 * 1024  
 
 app.request_class = CustomRequest
 
@@ -109,8 +133,6 @@ app.jinja_env.cache = {}
 
 secret_key = os.getenv("SECRET_KEY") or "dev_secret_123"
 app.secret_key = secret_key
-app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
-app.config["MAX_FORM_MEMORY_SIZE"] = 25 * 1024 * 1024
 
 LANG = {
     "en": {"welcome": "Welcome to Agri Vision"},
@@ -205,10 +227,6 @@ disease_info_map = {
 UNCERTAINTY_THRESHOLD = 0.45
 AMBIGUITY_MARGIN = 0.08
 
-
-# -------------------------------------------------------------------
-# THREAD-SAFE MODEL MANAGER
-# -------------------------------------------------------------------
 class ModelManager:
     _instance = None
     _instance_lock = threading.Lock()
@@ -253,20 +271,20 @@ class ModelManager:
                         )
                     self.resnet_model.eval()
                     self.errors["resnet"] = None
-                    logger.info("ResNet50 model loaded successfully")
+                    logger.info("ResNet50 loaded")
                 except Exception as exc:
                     self.errors["resnet"] = str(exc)
-                    logger.warning(f"ResNet50 model not found or failed to load: {exc}")
+                    logger.warning(f"ResNet50 load failed: {exc}")
                     self.resnet_model = None
 
             if self.yolo_model is None:
                 try:
                     self.yolo_model = YOLO(YOLO_MODEL_PATH)
                     self.errors["yolo"] = None
-                    logger.info("YOLOv8 model loaded successfully")
+                    logger.info("YOLOv8 loaded")
                 except Exception as exc:
                     self.errors["yolo"] = str(exc)
-                    logger.warning(f"YOLOv8 model not found or failed to load: {exc}")
+                    logger.warning(f"YOLOv8 load failed: {exc}")
                     self.yolo_model = None
 
             self.loaded = True
@@ -286,52 +304,25 @@ class ModelManager:
             },
         }
 
-
 model_manager = ModelManager()
 
 resnet_model = None
 yolo_model = None
 
-
-def load_models():
-    """Wrapper for backward compatibility"""
-    global resnet_model, yolo_model
-
 def load_models():
     global resnet_model, yolo_model
-    if resnet_model is None:
-        try:
-            resnet_model = torch.load(
-                'models/cotton_crop_disease_classification/full_resnet50_model.pth',
-                map_location=torch.device('cpu'),
-            )
-            logger.info("ResNet50 model loaded successfully")
-        except Exception as e:
-            logger.warning(f"ResNet50 model not found or failed to load: {e}")
-            resnet_model = None
-    if yolo_model is None:
-        try:
-            yolo_model = YOLO('models/cotton_crop_growth_stage_prediction/best.pt')
-            logger.info("YOLOv8 model loaded successfully")
-        except Exception as e:
-            logger.warning(f"YOLOv8 model not found or failed to load: {e}")
-            yolo_model = None
+    resnet_model, yolo_model = model_manager.load_models()
     return resnet_model, yolo_model
 
 def ensure_models_loaded() -> None:
     load_models()
 
-
-# -------------------------------------------------------------------
-# HELPER FUNCTIONS
-# -------------------------------------------------------------------
 def _ensure_rgb(image: np.ndarray) -> np.ndarray:
     if image is None:
         raise ValueError("Image is None")
     if image.ndim != 3 or image.shape[2] != 3:
         raise ValueError("Expected an RGB image with 3 channels")
     return image
-
 
 def resize_image(image: np.ndarray, max_dim: int = MAX_INFERENCE_DIMENSION) -> np.ndarray:
     height, width = image.shape[:2]
@@ -341,11 +332,8 @@ def resize_image(image: np.ndarray, max_dim: int = MAX_INFERENCE_DIMENSION) -> n
     new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
     return cv2.resize(image, new_size, interpolation=cv2.INTER_AREA)
 
-
 def calculate_disease_severity(health_score: float) -> float:
     return max(0.0, 100.0 - float(health_score))
-
-
 
 def generate_mock_heatmap(image_rgb: np.ndarray) -> np.ndarray:
     h, w, _ = image_rgb.shape
@@ -358,10 +346,10 @@ def generate_mock_heatmap(image_rgb: np.ndarray) -> np.ndarray:
     heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
     return heatmap
 
-
 # -------------------------------------------------------------------
 # INFERENCE PIPELINE
 # -------------------------------------------------------------------
+
 def preprocess_image_for_resnet(image: np.ndarray, target_size: Tuple[int, int] = (224, 224)) -> torch.Tensor:
     transform = transforms.Compose([
         transforms.ToPILImage(),
@@ -371,25 +359,20 @@ def preprocess_image_for_resnet(image: np.ndarray, target_size: Tuple[int, int] 
     tensor = transform(image).unsqueeze(0)
     return tensor
 
-
 def infer_disease(image):
-    # Returns all disease outputs, including confidences for each class
     if model_manager.resnet_model:
         processed = preprocess_image_for_resnet(image)
         with torch.no_grad():
             output = model_manager.resnet_model(processed)
             probs = F.softmax(output, dim=1)
             confidence, prediction = torch.max(probs, 1)
-        probs_np = probs.numpy()  # shape: (1, 8)
+        probs_np = probs.numpy()
         class_idx = int(prediction.item())
         confidence_value = float(confidence.item())
         predicted_class = disease_classes[class_idx]
         healthy_idx = disease_classes.index("Healthy")  
         health_score = float(probs_np[0][healthy_idx]) * 100
-
-
     else:
-        # Demo fallback
         probs_np = np.random.rand(1, len(disease_classes))
         probs_np = probs_np / probs_np.sum(axis=1, keepdims=True)
         class_idx = int(np.argmax(probs_np[0]))
@@ -397,7 +380,6 @@ def infer_disease(image):
         predicted_class = disease_classes[class_idx]
         health_score = float(np.max(probs_np[0]))*100
 
-    # Format probabilities per class
     disease_confidences = {disease_classes[i]: float(probs_np[0][i]) for i in range(len(disease_classes))}
 
     return {
@@ -431,11 +413,11 @@ def infer_growth_stage(image):
                         "class_id": class_id,
                         "class_name": growth_stage_classes[class_id] if class_id < len(growth_stage_classes) else str(class_id),
                         "confidence": conf,
-                        "bbox": xyxy,  # [x1, y1, x2, y2]
+                        "bbox": xyxy,
                     })
             else:
                 continue
-        # Most confident box as main prediction
+                
         if len(boxes):
             main = max(boxes, key=lambda x: x['confidence'])
             result.update({
@@ -446,7 +428,6 @@ def infer_growth_stage(image):
             result["boxes"] = boxes
         result["raw"] = boxes
     return result
-
 
 def generate_recommendations(disease_result: Dict[str, Any], growth_result: Dict[str, Any], weather: Optional[Dict[str, Any]] = None) -> list[str]:
     recs: list[str] = []
@@ -492,7 +473,6 @@ def generate_recommendations(disease_result: Dict[str, Any], growth_result: Dict
 
     return recs[:6]
 
-
 def generate_farmer_insights(disease_result: Dict[str, Any], growth_result: Dict[str, Any]) -> list[str]:
     insights = []
     dclass = disease_result["predicted_class"]
@@ -518,7 +498,6 @@ def generate_farmer_insights(disease_result: Dict[str, Any], growth_result: Dict
         insights.append("Ready for harvest. Ideal harvesting window is within 7 days.")
 
     return insights
-
 
 def generate_advanced_recommendations(disease_result: Dict[str, Any], growth_result: Dict[str, Any]) -> Dict[str, str]:
     gmain = growth_result.get("main_class", "Unknown")
@@ -547,8 +526,6 @@ def generate_advanced_recommendations(disease_result: Dict[str, Any], growth_res
         
     return adv_recs
 
-
-
 def encode_image_for_display(image: np.ndarray) -> str:
     display_image = resize_image(image, DISPLAY_IMAGE_MAX_DIMENSION)
     encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), DISPLAY_JPEG_QUALITY]
@@ -557,20 +534,16 @@ def encode_image_for_display(image: np.ndarray) -> str:
         raise ValueError("Failed to encode image for display")
     return base64.b64encode(buffer).decode("utf-8")
 
-
 def is_allowed_image(filename: str) -> bool:
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_IMAGE_EXTENSIONS
 
-
 def calculate_file_hash(file_storage) -> str:
-    """Generate SHA-256 hash for an uploaded file using chunk reading."""
     sha256_hash = hashlib.sha256()
     file_storage.seek(0)
     for byte_block in iter(lambda: file_storage.read(4096), b""):
         sha256_hash.update(byte_block)
     file_storage.seek(0)
     return sha256_hash.hexdigest()
-
 
 def read_uploaded_image(file_storage) -> Tuple[str, np.ndarray, np.ndarray]:
     safe_filename = secure_filename(file_storage.filename)
@@ -580,10 +553,6 @@ def read_uploaded_image(file_storage) -> Tuple[str, np.ndarray, np.ndarray]:
         raise ValueError("Error reading image file")
     return safe_filename, image, cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-
-# -------------------------------------------------------------------
-# THREAD-SAFE GRAD-CAM CACHE
-# -------------------------------------------------------------------
 GRAD_CAM_CACHE = {}
 GRAD_CAM_CACHE_LOCK = threading.Lock()
 MAX_CACHE_SIZE = 100
@@ -602,7 +571,6 @@ def set_cached_grad_cam(
 ) -> None:
     with GRAD_CAM_CACHE_LOCK:
         if len(GRAD_CAM_CACHE) >= MAX_CACHE_SIZE:
-            # FIFO eviction
             first_key = next(iter(GRAD_CAM_CACHE))
             GRAD_CAM_CACHE.pop(first_key, None)
         GRAD_CAM_CACHE[image_hash] = {
@@ -685,11 +653,9 @@ def build_gradcam_payload(
 
     return payload
 
-
 def analyze_image(image: np.ndarray) -> Dict[str, Any]:
     import time
     start_time = time.time()
-    
     resnet_model, yolo_model = model_manager.load_models()
     try:
         try:
@@ -711,10 +677,10 @@ def analyze_image(image: np.ndarray) -> Dict[str, Any]:
         disease["heatmap_image_path"] = gradcam_payload.get("heatmap_image_path")
         disease["heatmap_only_path"] = gradcam_payload.get("heatmap_only_path")
         disease["explainability"] = gradcam_payload.get("explainability")
+        
         # Track metrics in registry
         inference_time = time.time() - start_time
         try:
-            # Update ResNet metrics
             if disease and disease.get("confidence"):
                 registry.update_metrics(
                     model_type="resnet",
@@ -724,7 +690,6 @@ def analyze_image(image: np.ndarray) -> Dict[str, Any]:
                     success=True
                 )
             
-            # Update YOLO metrics
             if growth and growth.get("confidence"):
                 registry.update_metrics(
                     model_type="yolo",
@@ -735,48 +700,6 @@ def analyze_image(image: np.ndarray) -> Dict[str, Any]:
                 )
         except Exception as e:
             logger.error(f"Error tracking metrics: {e}")
-
-        # Check cache first
-        image_hash = hashlib.sha256(image.tobytes()).hexdigest()
-        cached_result = get_cached_grad_cam(image_hash)
-        
-        grad_cam_image_b64 = None
-        heatmap_only_b64 = None
-        
-        if cached_result is not None:
-            grad_cam_image_b64, heatmap_only_b64 = cached_result
-            logger.info("Using cached Grad-CAM heatmaps")
-        else:
-            if resnet_model is not None and disease.get("predicted_class_idx") is not None:
-                try:
-                    input_tensor = preprocess_image_for_resnet(image)
-                    with GradCAM(resnet_model, resnet_model.layer4[-1]) as grad_cam:
-                        grad_cam_overlay = grad_cam(input_tensor, disease["predicted_class_idx"], image)
-                        heatmap_np = getattr(grad_cam, "heatmap_np", None)
-                    if grad_cam_overlay is not None:
-                        grad_cam_image_b64 = encode_image_for_display(grad_cam_overlay)
-                    if heatmap_np is not None:
-                        pure_heatmap_rgb = generate_pure_heatmap(image, heatmap_np)
-                        heatmap_only_b64 = encode_image_for_display(pure_heatmap_rgb)
-                except Exception as exc:
-                    logger.error("Error generating Grad-CAM: %s", exc)
-
-            if grad_cam_image_b64 is None or heatmap_only_b64 is None:
-                try:
-                    mock_heatmap = generate_mock_heatmap(image)
-                    mock_overlay = apply_heatmap_on_image(image, mock_heatmap)
-                    grad_cam_image_b64 = encode_image_for_display(mock_overlay)
-                    
-                    pure_heatmap_rgb = generate_pure_heatmap(image, mock_heatmap)
-                    heatmap_only_b64 = encode_image_for_display(pure_heatmap_rgb)
-                except Exception as exc:
-                    logger.error("Error generating fallback heatmap: %s", exc)
-            
-            if grad_cam_image_b64 and heatmap_only_b64:
-                set_cached_grad_cam(image_hash, grad_cam_image_b64, heatmap_only_b64)
-
-        disease["heatmap_b64"] = grad_cam_image_b64
-        disease["heatmap_only_b64"] = heatmap_only_b64
 
         recs = generate_recommendations(disease, growth)
         severity = calculate_disease_severity(disease["health_score"])
@@ -808,27 +731,25 @@ def analyze_image(image: np.ndarray) -> Dict[str, Any]:
         }
 
         if growth.get("main_class") is None:
-            fallback_reason = "Growth stage model unavailable in this deployment." if yolo_model is None else "Cotton growth stage could not be detected from the uploaded image."
+            fallback_reason = "Growth stage model unavailable." if yolo_model is None else "Cotton growth stage could not be detected."
             result["warnings"] = [
                 fallback_reason,
-                "Disease analysis is still provided, but comparison may be less reliable without a confirmed cotton crop detection.",
-                "Grad-CAM explainability may also be affected if the primary crop is not detected.",
+                "Disease analysis is still provided, but comparison may be less reliable.",
             ]
 
         return result
     except Exception as exc:
         logger.error("Unexpected error in image analysis: %s", exc)
-        return {"error": "The AI model encountered an unexpected error while analyzing the image. Please verify the image file format and content and try again."}
-
+        return {"error": "The AI model encountered an error. Please verify the image file."}
 
 def build_comparison_result(old_results: Dict[str, Any], new_results: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(old_results, dict) or not isinstance(new_results, dict):
-        raise ValueError("Comparison analysis did not produce valid result objects.")
+        raise ValueError("Invalid result objects.")
 
     old_disease = old_results.get("disease")
     new_disease = new_results.get("disease")
     if old_disease is None or new_disease is None:
-        raise ValueError("Unable to compare the provided images because one or both images did not contain a valid cotton crop analysis.")
+        raise ValueError("Valid crop analysis missing in one or both images.")
 
     old_score = float(old_disease.get("health_score", 0.0))
     new_score = float(new_disease.get("health_score", 0.0))
@@ -838,15 +759,15 @@ def build_comparison_result(old_results: Dict[str, Any], new_results: Dict[str, 
     if change > 1:
         trend = {"status": "improved", "label": "Improved", "icon": "fa-arrow-trend-up", "direction": "up"}
         headline = f"Crop health improved by {abs_change:.1f}%"
-        recommendation = "Continue the current treatment plan, keep irrigation steady, and scout every few days to confirm the recovery trend."
+        recommendation = "Continue current treatment plan."
     elif change < -1:
         trend = {"status": "declined", "label": "Declined", "icon": "fa-arrow-trend-down", "direction": "down"}
         headline = f"Crop health declined by {abs_change:.1f}%"
-        recommendation = "Increase field inspection frequency, isolate visibly affected plants, and consider expert guidance before the disease pressure spreads."
+        recommendation = "Increase inspection frequency."
     else:
         trend = {"status": "stable", "label": "Stable", "icon": "fa-arrows-left-right", "direction": "flat"}
         headline = "Crop health remained stable"
-        recommendation = "Maintain the current crop care routine and compare again after the next treatment or irrigation cycle."
+        recommendation = "Maintain current routine."
 
     old_predicted = old_disease.get("predicted_class", "Unknown")
     new_predicted = new_disease.get("predicted_class", "Unknown")
@@ -855,16 +776,9 @@ def build_comparison_result(old_results: Dict[str, Any], new_results: Dict[str, 
 
     summary = [
         headline,
-        "Disease spread reduced" if disease_reduced else (f"Disease signal shifted from {old_predicted} to {new_predicted}" if disease_changed else f"Disease signal remains {new_predicted}"),
+        "Disease spread reduced" if disease_reduced else (f"Signal shifted to {new_predicted}" if disease_changed else f"Signal remains {new_predicted}"),
         recommendation,
     ]
-
-    if new_results.get("recommendations"):
-        summary.append(f"Model priority: {new_results['recommendations'][0]}")
-
-    if isinstance(new_results.get("farmer_insights"), list):
-        insight_msg = f"Crop health improved by {abs_change:.1f}% this week." if change > 0 else (f"Crop health declined by {abs_change:.1f}% this week." if change < 0 else "Crop health remained stable this week.")
-        new_results["farmer_insights"].insert(0, insight_msg)
 
     return {
         "old_score": old_score,
@@ -876,10 +790,6 @@ def build_comparison_result(old_results: Dict[str, Any], new_results: Dict[str, 
         "summary": summary,
     }
 
-
-# -------------------------------------------------------------------
-# FLASK ROUTES
-# -------------------------------------------------------------------
 @app.after_request
 def add_no_cache_headers(response):
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
@@ -887,21 +797,14 @@ def add_no_cache_headers(response):
     response.headers["Expires"] = "0"
     return response
 
-
-def is_pytest_mode() -> bool:
-    return "PYTEST_CURRENT_TEST" in os.environ
-
-
 @app.route("/")
 def index():
     lang = request.args.get("lang", "en")
     return render_template("index.html", text=LANG.get(lang, LANG["en"]), lang=lang)
 
-
 @app.route("/set-language/<lang>")
 def set_language(lang):
     return redirect(url_for("index", lang=lang))
-
 
 @app.template_filter("datetimeformat")
 def datetimeformat_filter(value):
@@ -909,21 +812,17 @@ def datetimeformat_filter(value):
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return value
 
-
 @app.route("/tutorials")
 def tutorials():
     return render_template("tutorials.html")
-
 
 @app.route("/support")
 def support():
     return render_template("support.html")
 
-
 @app.route("/stories")
 def stories():
     return render_template("stories.html")
-
 
 @app.route("/model-admin")
 @login_required
@@ -932,7 +831,6 @@ def admin_dashboard():
         flash('Access denied. Researchers and Admins only.', 'danger')
         return redirect(url_for('index'))
     return render_template("admin.html")
-
 
 # --- Model Management Admin Endpoints ---
 
@@ -1115,7 +1013,6 @@ def set_rollback_threshold():
         logger.error(f"Error setting rollback threshold: {e}")
         return jsonify({"error": str(e)}), 500
 
-
 @app.route('/admin/models/export/pdf', methods=['GET'])
 def export_pdf():
     """Export model metrics as PDF"""
@@ -1124,7 +1021,6 @@ def export_pdf():
         from reportlab.lib.pagesizes import letter
         from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
         from reportlab.lib.styles import getSampleStyleSheet
-        from io import BytesIO
 
         models = registry.list_models()
         
@@ -1133,17 +1029,14 @@ def export_pdf():
         elements = []
         styles = getSampleStyleSheet()
 
-        # Title
         title = Paragraph("Model Performance Report", styles['Title'])
         elements.append(title)
         elements.append(Spacer(1, 12))
 
-        # Date
         date = Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal'])
         elements.append(date)
         elements.append(Spacer(1, 12))
 
-        # Table data
         table_data = [['Model Type', 'Version', 'Accuracy', 'Requests', 'Success Rate', 'Avg Confidence', 'Avg Time', 'Status']]
         
         if models:
@@ -1162,7 +1055,6 @@ def export_pdf():
                         'Active' if model.is_active else 'Inactive'
                     ])
 
-        # Create table
         table = Table(table_data)
         table.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
@@ -1200,9 +1092,9 @@ def download_analysis_report():
         from reportlab.lib import colors
         from reportlab.lib.pagesizes import letter
         from reportlab.lib.units import inch
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage, PageBreak
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-        from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+        from reportlab.lib.enums import TA_CENTER
         from io import BytesIO
         import base64
         from PIL import Image as PILImage
@@ -1418,11 +1310,9 @@ def download_analysis_report():
         logger.error(f"Error generating analysis PDF: {e}")
         return jsonify({"error": f"Failed to generate PDF: {str(e)}"}), 500
 
-
 @app.route("/history")
 def history():
     return render_template("history.html")
-
 
 @app.route("/health")
 def health():
@@ -1432,13 +1322,9 @@ def health():
     status_code = 200 if model_loaded else 503
     return jsonify({
         "status": "healthy" if model_loaded else "degraded",
-        "mode": "ready" if model_loaded else "degraded",
-        "timestamp": datetime.now().isoformat(),
         "model_loaded": model_loaded,
         "models": diagnostics,
-        "service": "Agri-Vision Cotton Analysis API",
     }), status_code
-
 
 @app.route("/analyze", methods=["GET", "POST"])
 @login_required
@@ -1500,11 +1386,6 @@ def analyze():
                 heatmap_image_path=results.get("heatmap_image_path"),
                 heatmap_only_path=results.get("heatmap_only_path"),
                 disease_info=disease_info,
-            )
-                weather=weather,
-                grad_cam_image_b64=results.get("grad_cam_image_b64"),
-                heatmap_only_b64=results.get("heatmap_only_b64"),
-                disease_info=disease_info,
                 treatment_recommendations=results.get("treatment_recommendations", {}),
             )
         except Exception as exc:
@@ -1513,7 +1394,6 @@ def analyze():
             return redirect(request.url)
 
     return render_template("upload.html")
-
 
 @app.route("/api/explain", methods=["POST"])
 def api_explain():
@@ -1531,7 +1411,6 @@ def api_explain():
         _, image, image_rgb = read_uploaded_image(file)
         compressed_rgb = resize_image(image_rgb, MAX_INFERENCE_DIMENSION)
         
-        # We just need to call analyze_image to generate the Grad-CAM and get results
         results = analyze_image(compressed_rgb)
         
         if "error" in results:
@@ -1551,7 +1430,6 @@ def api_explain():
     except Exception as exc:
         logger.error("Error in API explain endpoint: %s", exc)
         return jsonify({"status": "error", "error": str(exc)}), 500
-
 
 @app.route("/comparison", methods=["GET", "POST"])
 def comparison():
@@ -1633,7 +1511,6 @@ def comparison():
             )
     return render_template("comparison.html")
 
-
 @app.route("/demo")
 def demo():
     try:
@@ -1655,76 +1532,46 @@ def demo():
             {"class_id": 3, "class_name": "Matured Cotton Boll", "confidence": 0.91, "bbox": [120, 80, 210, 155]},
             {"class_id": 4, "class_name": "Split Cotton Boll", "confidence": 0.70, "bbox": [300, 120, 390, 210]},
         ]
-
         demo_growth = {
-        "main_class": "Matured Cotton Boll",
-        "main_class_idx": 3,
-        "confidence": 0.91,
-        "boxes": demo_growth_boxes,
-        "raw": demo_growth_boxes,
+            "main_class": "Matured Cotton Boll",
+            "main_class_idx": 3,
+            "confidence": 0.91,
+            "boxes": demo_growth_boxes,
+            "raw": demo_growth_boxes,
         }
-    
-        # Generate high-quality synthetic cotton BGR image representing field crop
+
         synthetic_bgr = np.zeros((384, 512, 3), dtype=np.uint8)
-    
-        # Fill background with a rich soft earthy background
         synthetic_bgr[:, :] = [30, 40, 45]
-    
-        # Draw deep-green leaf foliage (multiple overlapping green circles)
-        cv2.circle(synthetic_bgr, (200, 220), 120, (34, 139, 34), -1) # Forest Green
-        cv2.circle(synthetic_bgr, (320, 260), 100, (46, 139, 87), -1) # Sea Green
-        cv2.circle(synthetic_bgr, (120, 280), 90, (34, 120, 34), -1) # Darker Green
-    
-        # Draw organic branch structure
+        cv2.circle(synthetic_bgr, (200, 220), 120, (34, 139, 34), -1)
+        cv2.circle(synthetic_bgr, (320, 260), 100, (46, 139, 87), -1)
+        cv2.circle(synthetic_bgr, (120, 280), 90, (34, 120, 34), -1)
         cv2.line(synthetic_bgr, (256, 384), (256, 200), (42, 75, 124), 12)
         cv2.line(synthetic_bgr, (256, 260), (140, 180), (42, 75, 124), 8)
         cv2.line(synthetic_bgr, (256, 220), (380, 150), (42, 75, 124), 8)
-    
-        # Draw localized crop anomalies (reddish-brown leaf spots / target spot disease representation)
         cv2.circle(synthetic_bgr, (220, 200), 15, (40, 50, 139), -1)
         cv2.circle(synthetic_bgr, (215, 195), 5, (20, 30, 80), -1)
         cv2.circle(synthetic_bgr, (180, 240), 10, (40, 50, 139), -1)
-    
-        # Draw Matured Cotton Boll within [120, 80, 210, 155] (center is (165, 117.5))
         cv2.ellipse(synthetic_bgr, (165, 117), (40, 30), 0, 0, 360, (50, 180, 100), -1)
         cv2.ellipse(synthetic_bgr, (165, 117), (40, 30), 0, 0, 360, (40, 140, 80), 2)
         cv2.line(synthetic_bgr, (165, 87), (165, 75), (42, 75, 124), 4)
-
-        # Draw Split Cotton Boll within [300, 120, 390, 210] (center is (345, 165))
         cv2.circle(synthetic_bgr, (330, 165), 20, (245, 245, 245), -1)
         cv2.circle(synthetic_bgr, (360, 165), 20, (245, 245, 245), -1)
         cv2.circle(synthetic_bgr, (345, 150), 20, (255, 255, 255), -1)
         cv2.circle(synthetic_bgr, (345, 180), 20, (230, 230, 230), -1)
         cv2.ellipse(synthetic_bgr, (345, 185), (35, 15), 0, 0, 360, (30, 50, 90), -1)
-    
-        # Convert from BGR to RGB
+
         synthetic_rgb = cv2.cvtColor(synthetic_bgr, cv2.COLOR_BGR2RGB)
-    
-        # Generate mock heatmap
-        mock_heatmap = generate_mock_heatmap(synthetic_rgb)
-        mock_overlay = apply_heatmap_on_image(synthetic_rgb, mock_heatmap)
-    
-        # Base64 encode both original synthetic image and XAI overlay
+        
+        # generate mock fallback heatmap
+        from services.gradcam import generate_pure_heatmap
+        mock_heatmap_np = generate_mock_heatmap(synthetic_rgb)
+        pure_heatmap_rgb = generate_pure_heatmap(synthetic_rgb, mock_heatmap_np)
+        mock_overlay = cv2.addWeighted(synthetic_rgb, 0.6, pure_heatmap_rgb, 0.4, 0)
+        
         image_b64 = encode_image_for_display(synthetic_rgb)
         grad_cam_image_b64 = encode_image_for_display(mock_overlay)
-    
-        # Set top-level and nested properties for robustness
-        demo_disease["heatmap_b64"] = grad_cam_image_b64
-    
-        # Calculate Severity
-        severity = calculate_disease_severity(demo_disease["health_score"])
-    
-        # Use estimate_yield from service
-        from services.yield_service import estimate_yield
-        yield_est = estimate_yield(demo_disease, demo_growth, weather=None, field_acres=1.0)
-    
-        # Generate advanced recommendations
-        adv_recs = generate_advanced_recommendations(demo_disease, demo_growth)
-    
-        # Generate farmer insights
-        insights = generate_farmer_insights(demo_disease, demo_growth)
+        heatmap_only_b64 = encode_image_for_display(pure_heatmap_rgb)
 
-        # Context-aware treatment recommendations for demo
         demo_treatment_recs = get_treatment_recommendations(
             crop_type="cotton",
             disease_name=demo_disease.get("predicted_class", "Healthy"),
@@ -1732,16 +1579,20 @@ def demo():
         )
 
         example_json = {
-        "disease": demo_disease,
-        "growth": demo_growth,
-        "recommendations": generate_recommendations(demo_disease, demo_growth),
-        "grad_cam_image_b64": grad_cam_image_b64,
-        "disease_severity": severity,
-        "yield_estimate": yield_est,
-        "advanced_recommendations": adv_recs,
-        "farmer_insights": insights,
-        "treatment_recommendations": demo_treatment_recs,
+            "disease": demo_disease,
+            "growth": demo_growth,
+            "recommendations": generate_recommendations(demo_disease, demo_growth),
+            "grad_cam_image_b64": grad_cam_image_b64,
+            "heatmap_only_b64": heatmap_only_b64,
+            "heatmap_image_path": None,
+            "heatmap_only_path": None,
+            "disease_severity": calculate_disease_severity(demo_disease["health_score"]),
+            "yield_estimate": estimate_yield(demo_disease, demo_growth, weather=None, field_acres=1.0),
+            "advanced_recommendations": generate_advanced_recommendations(demo_disease, demo_growth),
+            "farmer_insights": generate_farmer_insights(demo_disease, demo_growth),
+            "treatment_recommendations": demo_treatment_recs,
         }
+
         return render_template(
             "results.html",
             results=example_json,
@@ -1751,32 +1602,21 @@ def demo():
             raw_json=json.dumps(example_json, indent=2),
             timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             grad_cam_image_b64=grad_cam_image_b64,
+            heatmap_only_b64=heatmap_only_b64,
             heatmap_image_path=None,
             heatmap_only_path=None,
-            yield_estimate=yield_est,
+            yield_estimate=example_json["yield_estimate"],
             disease_info=disease_info_map.get("Healthy", {}),
+            treatment_recommendations=demo_treatment_recs,
             weather=None
-        "results.html",
-        results=example_json,
-        filename="demo_cotton.jpg",
-        image_b64=image_b64,
-        img_shape={"width": 512, "height": 384},
-        raw_json=json.dumps(example_json, indent=2),
-        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        grad_cam_image_b64=grad_cam_image_b64,
-        yield_estimate=yield_est, # Also pass as top-level for robustness
-        treatment_recommendations=demo_treatment_recs,
         )
-
     except Exception as e:
         logger.error(f"Demo route failed: {e}")
         return redirect(url_for("index"))
 
-
 @app.route("/api/chat_test", methods=["GET"])
 def api_chat_test():
     return jsonify({"status": "ok"})
-
 
 @app.route("/api/chat", methods=["POST"])
 @app.route("/api/chat/", methods=["POST"])
@@ -1838,7 +1678,6 @@ def api_chat():
             reply = random.choice(reply_options)
             break
     else:
-        # If the loop finishes without hitting 'break', it means no pattern matched
         logger.info(f"Unmatched chat query: {message}")
 
     return jsonify({"reply": reply})
@@ -1866,32 +1705,57 @@ def api_weather():
     weather["weather_recommendations"] = generate_weather_recommendations(weather)
     return jsonify({"status": "success", "weather": weather})
 
-
+# --- core api with redis cache & rate limiting ---
 @app.route("/api/analyze", methods=["POST"])
+@limiter.limit("10 per minute")
 def api_analyze():
     if 'file' not in request.files:
         return jsonify({'error': 'No file uploaded'}), 400
     
     file = request.files['file']
-    
     if file.filename == '':
         return jsonify({'error': 'No file selected'}), 400
+        
     try:
         file_bytes = np.frombuffer(file.read(), np.uint8)
+        file_hash = hashlib.sha256(file_bytes).hexdigest()
+        cache_key = f"inference_cache:{file_hash}"
+        
+        if redis_client:
+            cached = redis_client.get(cache_key)
+            if cached:
+                logger.info("cache hit - skipping model inference")
+                res = make_response(cached)
+                res.headers['Content-Type'] = 'application/json'
+                res.headers['X-Cache-Hit'] = '1'
+                return res
+                
+        logger.info("cache miss - running inference")
         image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
         if image is None:
             return jsonify({'error': 'Invalid image file'}), 400
+            
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         results = analyze_image(image_rgb)
-        return jsonify({
+        
+        resp_data = {
             "status": "success",
             "timestamp": datetime.now().isoformat(),
             "results": results
-        })
+        }
+        resp_json = json.dumps(resp_data)
+        
+        if redis_client:
+            redis_client.setex(cache_key, 86400, resp_json)
+            
+        res = make_response(resp_json)
+        res.headers['Content-Type'] = 'application/json'
+        res.headers['X-Cache-Hit'] = '0'
+        return res
+        
     except Exception as e:
         logger.error(f"API analysis error: {e}")
         return jsonify({'error': str(e)}), 500
-
 
 @app.route("/api/analyze_stream", methods=["POST"])
 def api_analyze_stream():
@@ -1904,7 +1768,6 @@ def api_analyze_stream():
     
     def generate():
         try:
-            # Send progress updates
             yield f"data: {json.dumps({'status': 'uploading', 'progress': 25})}\n\n"
             
             file_bytes = np.frombuffer(file.read(), np.uint8)
@@ -1919,30 +1782,10 @@ def api_analyze_stream():
             compressed_rgb = resize_image(image_rgb, MAX_INFERENCE_DIMENSION)
             results = analyze_image(compressed_rgb)
             if results.get("error"):
-                return jsonify({"error": results["error"]}), 400
-            return jsonify({
-                "status": "success",
-                "timestamp": datetime.now().isoformat(),
-                "results": results,
-                "explainability": results.get("explainability"),
-                "heatmap_image_path": results.get("heatmap_image_path"),
-            }), 200
-
-        from celery_worker import process_inference_task
-        task = process_inference_task.delay(file_bytes.tolist())
-        return jsonify({
-            "status": "processing",
-            "task_id": task.id,
-            "message": "Image analysis has started in the background. Use the task_id to poll for results.",
-        }), 202
-
-    except Exception as exc:
-        logger.error("API analysis trigger error: %s", exc)
-        return jsonify({"error": str(exc)}), 500
-            results = analyze_image(image_rgb)
-            
+                yield f"data: {json.dumps({'status': 'error', 'message': results['error']})}\n\n"
+                return
+                
             yield f"data: {json.dumps({'status': 'generating', 'progress': 75})}\n\n"
-            
             yield f"data: {json.dumps({'status': 'complete', 'progress': 100, 'results': results})}\n\n"
         except Exception as e:
             logger.error(f"Streaming analysis error: {e}")
@@ -1950,9 +1793,7 @@ def api_analyze_stream():
     
     return Response(stream_with_context(generate()), mimetype='text/event-stream')
 
-
 # --- Batch Processing Endpoints ---
-
 @app.route("/api/batch_upload", methods=["POST"])
 def api_batch_upload():
     """Upload multiple images for batch analysis"""
@@ -1964,7 +1805,6 @@ def api_batch_upload():
         if not files or files[0].filename == '':
             return jsonify({'error': 'No files selected'}), 400
         
-        # Validate files
         valid_files = []
         for file in files:
             if file and allowed_file(file.filename):
@@ -1973,8 +1813,7 @@ def api_batch_upload():
         if not valid_files:
             return jsonify({'error': 'No valid image files'}), 400
         
-        # Create batch job
-        from models import BatchJob, db
+        from models import BatchJob, db, AnalysisResult
         job = BatchJob(
             total_images=len(valid_files),
             status='pending'
@@ -1982,93 +1821,60 @@ def api_batch_upload():
         db.session.add(job)
         db.session.commit()
         
-        # Prepare image data for Celery
         images_data = []
         for file in valid_files:
             file_data = file.read()
             images_data.append((file.filename, file_data))
-        
-        # Start batch processing (try to import Celery)
-        try:
-            from celery_tasks import process_batch_job
-            process_batch_job.delay(job.id, images_data)
-            celery_enabled = True
-        except Exception as e:
-            logger.error(f"Celery not available: {e}")
-            celery_enabled = False
-            # Process synchronously if Celery is not available
-            job.status = 'processing'
-            db.session.commit()
             
-            # Process images one by one
-            import cv2
-            import numpy as np
-            for idx, (filename, image_data) in enumerate(images_data):
-                try:
-                    file_bytes = np.frombuffer(image_data, np.uint8)
-                    image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-                    if image is not None:
-                        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                        results = analyze_image(image_rgb)
-                        
-                        # Save result
-                        from models import AnalysisResult
-                        result = AnalysisResult(
-                            batch_job_id=job.id,
-                            image_name=filename,
-                            image_index=idx,
-                            status='complete',
-                            disease_class=results.get('disease', {}).get('predicted_class'),
-                            disease_confidence=results.get('disease', {}).get('confidence'),
-                            health_score=results.get('disease', {}).get('health_score'),
-                            growth_class=results.get('growth', {}).get('main_class'),
-                            growth_confidence=results.get('growth', {}).get('confidence'),
-                            results_json=results
-                        )
-                        db.session.add(result)
-                except Exception as e:
-                    logger.error(f"Error processing image {filename}: {e}")
-                    from models import AnalysisResult
+        import cv2
+        import numpy as np
+        for idx, (filename, image_data) in enumerate(images_data):
+            try:
+                file_bytes = np.frombuffer(image_data, np.uint8)
+                image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+                if image is not None:
+                    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                    results = analyze_image(image_rgb)
+                    
                     result = AnalysisResult(
                         batch_job_id=job.id,
                         image_name=filename,
                         image_index=idx,
-                        status='error',
-                        error_message=str(e)
+                        status='complete',
+                        disease_class=results.get('disease', {}).get('predicted_class'),
+                        disease_confidence=results.get('disease', {}).get('confidence'),
+                        health_score=results.get('disease', {}).get('health_score'),
+                        growth_class=results.get('growth', {}).get('main_class'),
+                        growth_confidence=results.get('growth', {}).get('confidence'),
+                        results_json=results
                     )
                     db.session.add(result)
-            
-            job.status = 'completed'
-            job.completed_at = datetime.utcnow()
-            db.session.commit()
+            except Exception as e:
+                logger.error(f"Error processing image {filename}: {e}")
+                result = AnalysisResult(
+                    batch_job_id=job.id,
+                    image_name=filename,
+                    image_index=idx,
+                    status='error',
+                    error_message=str(e)
+                )
+                db.session.add(result)
+        
+        job.status = 'completed'
+        job.completed_at = datetime.utcnow()
+        db.session.commit()
         
         return jsonify({
-            "status": "success",
-            "timestamp": datetime.now().isoformat(),
-            "filename": safe_filename,
-            "predicted_class": disease.get("predicted_class"),
-            "confidence": disease.get("confidence"),
-            "health_score": disease.get("health_score"),
-            "image_b64": encode_image_for_display(image_rgb),
-            "heatmap_b64": results.get("grad_cam_image_b64"),
-            "heatmap_only_b64": results.get("heatmap_only_b64"),
-            "heatmap_image_path": results.get("heatmap_image_path"),
-            "heatmap_only_path": results.get("heatmap_only_path"),
-            "explainability": results.get("explainability"),
-            "target_layer": "ResNet50 layer4[-1]",
-            "all_confidences": disease.get("all_confidences", {})
-        }), 200
             'status': 'success',
             'job_id': job.id,
             'total_images': len(valid_files),
-            'celery_enabled': celery_enabled,
+            'celery_enabled': False,
             'message': f'Batch job {job.id} started with {len(valid_files)} images'
         })
         
     except Exception as e:
         logger.error(f"Batch upload error: {e}")
         return jsonify({'error': str(e)}), 500
-
 
 @app.route("/api/batch_status/<job_id>", methods=["GET"])
 def api_batch_status(job_id):
@@ -2079,18 +1885,15 @@ def api_batch_status(job_id):
     if not job:
         return jsonify({'error': 'Batch job not found'}), 404
     
-    # Update completed count from results
     job.completed_images = len([r for r in job.results if r.status == 'complete'])
     job.failed_images = len([r for r in job.results if r.status == 'error'])
     
-    # Check if all tasks are done
     if job.completed_images + job.failed_images >= job.total_images:
         job.status = 'completed'
         job.completed_at = datetime.utcnow()
         db.session.commit()
     
     return jsonify(job.to_dict())
-
 
 @app.route("/api/batch_results/<job_id>", methods=["GET"])
 def api_batch_results(job_id):
@@ -2128,7 +1931,6 @@ def export_batch_csv(job_id):
     cw = csv.writer(si)
     cw.writerow(['Image Name', 'Status', 'Disease', 'Confidence', 'Health Score', 'Growth Stage'])
     
-    # Sort results by image index
     results = sorted(job.results, key=lambda x: x.image_index)
     
     for r in results:
@@ -2159,7 +1961,6 @@ def export_batch_csv(job_id):
         headers={"Content-disposition": f"attachment; filename=batch_results_{job_id}.csv"}
     )
 
-
 @app.route("/api/batch_results/<job_id>/export/pdf", methods=["GET"])
 def export_batch_pdf(job_id):
     """Export batch results as PDF"""
@@ -2182,18 +1983,15 @@ def export_batch_pdf(job_id):
     elements = []
     styles = getSampleStyleSheet()
 
-    # Title
     title = Paragraph(f"Batch Analysis Report (Job ID: {job_id})", styles['Title'])
     elements.append(title)
     elements.append(Spacer(1, 12))
 
-    # Summary
     summary_text = f"Total Images: {job.total_images} | Completed: {job.completed_images} | Failed: {job.failed_images}"
     summary = Paragraph(summary_text, styles['Normal'])
     elements.append(summary)
     elements.append(Spacer(1, 12))
 
-    # Table data
     table_data = [['Image Name', 'Status', 'Disease', 'Confidence', 'Health Score', 'Growth Stage']]
     
     results = sorted(job.results, key=lambda x: x.image_index)
@@ -2217,7 +2015,6 @@ def export_batch_pdf(job_id):
             growth_class
         ])
 
-    # Create table
     table = Table(table_data)
     table.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
@@ -2243,7 +2040,6 @@ def export_batch_pdf(job_id):
         mimetype='application/pdf'
     )
 
-
 @app.route("/batch", methods=["GET", "POST"])
 @login_required
 def batch_upload_page():
@@ -2252,42 +2048,11 @@ def batch_upload_page():
         return redirect(url_for('batch_results_page', job_id=request.form.get('job_id')))
     return render_template('batch_upload.html')
 
-        try:
-            resnet_model, _ = model_manager.load_models()
-            gradcam_payload = build_gradcam_payload(compressed_rgb, disease, resnet_model)
-            grad_cam_image_b64 = gradcam_payload.get("grad_cam_image_b64")
-            heatmap_only_b64 = gradcam_payload.get("heatmap_only_b64")
-
-            disease["heatmap_b64"] = grad_cam_image_b64
-            disease["heatmap_only_b64"] = heatmap_only_b64
-            disease["heatmap_image_path"] = gradcam_payload.get("heatmap_image_path")
-            disease["heatmap_only_path"] = gradcam_payload.get("heatmap_only_path")
-            disease["explainability"] = gradcam_payload.get("explainability")
-
-            results = {
-                "disease": disease,
-                "growth": growth,
-                "recommendations": generate_recommendations(disease, growth),
-                "grad_cam_image_b64": grad_cam_image_b64,
-                "heatmap_only_b64": heatmap_only_b64,
-                "heatmap_image_path": gradcam_payload.get("heatmap_image_path"),
-                "heatmap_only_path": gradcam_payload.get("heatmap_only_path"),
-                "explainability": gradcam_payload.get("explainability"),
-                "error": None,
-            }
-            if growth.get("main_class") is None:
-                results["warnings"] = ["Growth stage could not be confidently detected.", "Disease analysis is still provided based on the uploaded crop image."]
-            yield event("recommendations", 90, "Recommendations generated.")
-        except Exception as exc:
-            yield event("error", 90, f"Recommendation generation failed: {str(exc)}")
-            return
-
 @app.route("/batch/results/<job_id>")
 @login_required
 def batch_results_page(job_id):
     """Batch results page"""
     return render_template('batch_results.html', job_id=job_id)
-
 
 # --- Authentication Routes ---
 
@@ -2321,7 +2086,6 @@ def login():
     
     return render_template('login.html')
 
-
 @app.route("/register", methods=["GET", "POST"])
 def register():
     """Registration page"""
@@ -2335,7 +2099,6 @@ def register():
         confirm_password = request.form.get('confirm_password')
         role = request.form.get('role', 'farmer')
         
-        # Validation
         if not full_name or not email or not password:
             flash('All fields are required', 'danger')
             return render_template('register.html')
@@ -2353,7 +2116,6 @@ def register():
             flash('Email already registered', 'danger')
             return render_template('register.html')
         
-        # Create user
         user = User(
             email=email,
             full_name=full_name,
@@ -2369,7 +2131,6 @@ def register():
     
     return render_template('register.html')
 
-
 @app.route("/logout")
 @login_required
 def logout():
@@ -2378,32 +2139,11 @@ def logout():
     flash('You have been logged out', 'info')
     return redirect(url_for('login'))
 
-        try:
-            complete_payload = {
-                "results": results,
-                "filename": safe_filename,
-                "image_b64": image_b64,
-                "img_shape": img_shape,
-                "raw_json": _json.dumps(results, indent=2),
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "weather": weather,
-                "yield_estimate": yield_estimate,
-                "grad_cam_image_b64": grad_cam_image_b64,
-                "heatmap_only_b64": heatmap_only_b64,
-                "heatmap_image_path": results.get("heatmap_image_path"),
-                "heatmap_only_path": results.get("heatmap_only_path"),
-            }
-            yield event("complete", 100, "Analysis complete!", data=complete_payload)
-        except Exception as exc:
-            yield event("error", 95, f"Failed to finalise results: {str(exc)}")
-            return
-
 @app.route("/profile")
 @login_required
 def profile():
     """User profile page"""
     return render_template('profile.html')
-
 
 @app.route("/forgot_password", methods=["GET", "POST"])
 def forgot_password():
@@ -2412,8 +2152,7 @@ def forgot_password():
         email = request.form.get('email')
         flash('Password reset link sent to your email (demo feature)', 'info')
         return redirect(url_for('login'))
-    return render_template('login.html')  # Reuse login template for now
-
+    return render_template('login.html')
 
 # --- Geographic Disease Mapping ---
 
@@ -2423,26 +2162,21 @@ def disease_map():
     """Disease map page"""
     return render_template('disease_map.html')
 
-
 @app.route("/api/disease-map")
 @login_required
 def api_disease_map():
     """API endpoint for disease map data"""
     from models import AnalysisHistory
-    from datetime import datetime, timedelta
     
-    # Get filter parameters
     disease_filter = request.args.get('disease', 'all')
     time_filter = request.args.get('time', 'all')
     confidence_filter = float(request.args.get('confidence', 0))
     
-    # Build query - get all analyses first, then filter for location
     if current_user.is_researcher():
         query = AnalysisHistory.query
     else:
         query = AnalysisHistory.query.filter_by(user_id=current_user.id)
     
-    # Apply time filter
     if time_filter == 'today':
         query = query.filter(AnalysisHistory.created_at >= datetime.utcnow().replace(hour=0, minute=0, second=0))
     elif time_filter == 'week':
@@ -2452,27 +2186,21 @@ def api_disease_map():
     elif time_filter == 'year':
         query = query.filter(AnalysisHistory.created_at >= datetime.utcnow() - timedelta(days=365))
     
-    # Get analyses
     analyses = query.all()
     
-    # Filter for location data in Python (more flexible)
     filtered_analyses = []
     for a in analyses:
-        # Apply disease filter
         if disease_filter != 'all':
             if not a.disease_result or a.disease_result.get('predicted_class') != disease_filter:
                 continue
         
-        # Apply confidence filter
         if confidence_filter > 0:
             if not a.confidence or a.confidence < confidence_filter / 100:
                 continue
         
-        # Only include analyses with location data
         if a.latitude and a.longitude:
             filtered_analyses.append(a)
     
-    # Calculate statistics
     total_analyses = len(filtered_analyses)
     healthy_count = sum(1 for a in filtered_analyses if a.disease_result and a.disease_result.get('predicted_class') == 'healthy')
     diseased_count = total_analyses - healthy_count
@@ -2490,7 +2218,6 @@ def api_disease_map():
         }
     })
 
-
 # --- Advanced Dashboard ---
 
 @app.route("/dashboard")
@@ -2499,28 +2226,22 @@ def dashboard():
     """Advanced dashboard page"""
     return render_template('dashboard.html')
 
-
 @app.route("/api/dashboard-stats")
 @login_required
 def api_dashboard_stats():
     """API endpoint for dashboard statistics"""
     from models import AnalysisHistory
-    from datetime import datetime, timedelta
-    from collections import defaultdict
     
-    # Get all analyses for current user
     if current_user.is_researcher():
         analyses = AnalysisHistory.query.all()
     else:
         analyses = AnalysisHistory.query.filter_by(user_id=current_user.id).all()
     
-    # Calculate basic statistics
     total_analyses = len(analyses)
     healthy_count = sum(1 for a in analyses if a.disease_result and a.disease_result.get('predicted_class') == 'healthy')
     diseased_count = total_analyses - healthy_count
     avg_health_score = sum(a.health_score for a in analyses if a.health_score) / len([a for a in analyses if a.health_score]) if analyses else 0
     
-    # Disease distribution
     disease_counts = defaultdict(int)
     for a in analyses:
         if a.disease_result:
@@ -2532,12 +2253,10 @@ def api_dashboard_stats():
         'values': list(disease_counts.values())
     }
     
-    # Disease trends (last 7 days)
     trend_labels = []
     trend_data = defaultdict(list)
     for i in range(7):
         date = datetime.utcnow() - timedelta(days=6-i)
-        date_str = date.strftime('%Y-%m-%d')
         trend_labels.append(date.strftime('%b %d'))
         
         day_analyses = [a for a in analyses if a.created_at.date() == date.date()]
@@ -2546,11 +2265,9 @@ def api_dashboard_stats():
                 disease = a.disease_result.get('predicted_class', 'unknown')
                 trend_data[disease].append(1)
     
-    # Create trend datasets
     trend_datasets = []
     colors = ['#22c55e', '#ef4444', '#f59e0b', '#8b5cf6', '#ec4899', '#06b6d4']
     for idx, (disease, counts) in enumerate(trend_data.items()):
-        # Aggregate by day
         daily_counts = []
         for i in range(7):
             date = datetime.utcnow() - timedelta(days=6-i)
@@ -2572,7 +2289,6 @@ def api_dashboard_stats():
         'datasets': trend_datasets
     }
     
-    # Growth stage distribution
     growth_counts = defaultdict(int)
     for a in analyses:
         if a.growth_result:
@@ -2584,7 +2300,6 @@ def api_dashboard_stats():
         'values': list(growth_counts.values())
     }
     
-    # Regional data
     region_counts = defaultdict(int)
     for a in analyses:
         if a.region:
@@ -2595,7 +2310,6 @@ def api_dashboard_stats():
         'values': list(region_counts.values())
     }
     
-    # Recent activity
     recent_analyses = sorted(analyses, key=lambda x: x.created_at, reverse=True)[:10]
     recent_activity = []
     for a in recent_analyses:
@@ -2625,7 +2339,6 @@ def api_dashboard_stats():
         'recent_activity': recent_activity
     })
 
-
 # --- Automated Reporting ---
 
 @app.route("/reports")
@@ -2633,7 +2346,6 @@ def api_dashboard_stats():
 def reports():
     """Reports page"""
     return render_template('reports.html')
-
 
 @app.route("/api/analyses")
 @login_required
@@ -2659,7 +2371,6 @@ def api_analyses():
     
     return jsonify({'analyses': analyses_list})
 
-
 @app.route("/api/generate-report/<analysis_id>")
 @login_required
 def generate_report(analysis_id):
@@ -2677,7 +2388,6 @@ def generate_report(analysis_id):
     if not analysis:
         return jsonify({'error': 'Analysis not found'}), 404
     
-    # Check permission
     if not current_user.is_researcher() and analysis.user_id != current_user.id:
         return jsonify({'error': 'Access denied'}), 403
     
@@ -2710,7 +2420,6 @@ def generate_report(analysis_id):
         logger.error(traceback.format_exc())
         return jsonify({'error': str(e)}), 500
 
-
 @app.route("/api/generate-summary-report")
 @login_required
 def generate_summary_report():
@@ -2729,7 +2438,6 @@ def generate_summary_report():
     days = request.args.get('days', 30, type=int)
     start_date = datetime.utcnow() - timedelta(days=days)
     
-    # Get analyses
     if current_user.is_researcher():
         analyses = AnalysisHistory.query.filter(AnalysisHistory.created_at >= start_date).all()
     else:
@@ -2763,26 +2471,6 @@ def generate_summary_report():
         logger.error(traceback.format_exc())
         return jsonify({'error': str(e)}), 500
 
-        return render_template(
-            "results.html",
-            results=results,
-            filename=filename,
-            image_b64=image_b64,
-            img_shape=img_shape,
-            raw_json=raw_json,
-            timestamp=timestamp,
-            weather=weather,
-            yield_estimate=yield_estimate,
-            grad_cam_image_b64=results.get("grad_cam_image_b64"),
-            heatmap_only_b64=results.get("heatmap_only_b64"),
-            heatmap_image_path=results.get("heatmap_image_path"),
-            heatmap_only_path=results.get("heatmap_only_path"),
-        )
-    except Exception as exc:
-        logger.error("analyze_result error: %s", exc)
-        flash(f"Failed to render results: {str(exc)}", "error")
-        return redirect(url_for("analyze"))
-
 # --- Disease Database & Symptom Checker ---
 
 @app.route("/disease-database")
@@ -2791,13 +2479,11 @@ def disease_database():
     """Disease database page"""
     return render_template('disease_database.html')
 
-
 @app.route("/symptom-checker")
 @login_required
 def symptom_checker():
     """Symptom checker page"""
     return render_template('symptom_checker.html')
-
 
 @app.route("/api/diseases")
 def api_diseases():
@@ -2826,7 +2512,6 @@ def api_diseases():
         'count': len(diseases)
     })
 
-
 @app.route("/api/diseases/<int:disease_id>")
 def api_disease_detail(disease_id):
     """API endpoint to get disease details"""
@@ -2837,7 +2522,6 @@ def api_disease_detail(disease_id):
         return jsonify({'error': 'Disease not found'}), 404
     
     return jsonify(disease.to_dict())
-
 
 @app.route("/api/symptoms")
 def api_symptoms():
@@ -2857,7 +2541,6 @@ def api_symptoms():
         'symptoms': [s.to_dict() for s in symptoms],
         'count': len(symptoms)
     })
-
 
 @app.route("/api/symptom-check", methods=['POST'])
 def api_symptom_check():
@@ -2898,7 +2581,6 @@ def api_symptom_check():
         'symptom_count': len(symptom_ids)
     })
 
-
 # --- Disease Forecast & Weather Prediction ---
 
 @app.route("/disease-forecast")
@@ -2906,7 +2588,6 @@ def api_symptom_check():
 def disease_forecast():
     """Disease forecast page"""
     return render_template('disease_forecast.html')
-
 
 @app.route("/api/weather-forecast")
 def api_weather_forecast():
@@ -2943,7 +2624,6 @@ def api_weather_forecast():
     except Exception as e:
         logger.error(f"Error fetching weather forecast: {e}")
         return jsonify({'error': str(e)}), 500
-
 
 @app.route("/api/disease-prediction/<disease_name>")
 def api_disease_prediction(disease_name):
@@ -2988,7 +2668,6 @@ def api_disease_prediction(disease_name):
     except Exception as e:
         logger.error(f"Error getting disease prediction: {e}")
         return jsonify({'error': str(e)}), 500
-
 
 @app.route("/api/historical-patterns")
 def api_historical_patterns():
@@ -3036,7 +2715,6 @@ def api_historical_patterns():
     except Exception as e:
         logger.error(f"Error analyzing historical patterns: {e}")
         return jsonify({'error': str(e)}), 500
-
 
 @app.route("/api/historical-predict")
 def api_historical_predict():
@@ -3097,7 +2775,6 @@ def api_historical_predict():
         logger.error(f"Error predicting from history: {e}")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route("/api/historical/peak-season/<disease_name>")
 def api_peak_season(disease_name):
     """API endpoint to get peak season for a specific disease"""
@@ -3120,7 +2797,6 @@ def api_peak_season(disease_name):
     except Exception as e:
         logger.error(f"Error getting peak season: {e}")
         return jsonify({'error': str(e)}), 500
-
 
 @app.route("/api/historical/regional-ranking")
 def api_regional_ranking():
@@ -3152,7 +2828,6 @@ def api_regional_ranking():
         logger.error(f"Error getting regional ranking: {e}")
         return jsonify({'error': str(e)}), 500
 
-
 @app.route("/api/historical/disease-trend/<disease_name>")
 def api_disease_trend(disease_name):
     """API endpoint to get disease trend analysis"""
@@ -3177,7 +2852,6 @@ def api_disease_trend(disease_name):
     except Exception as e:
         logger.error(f"Error getting disease trend: {e}")
         return jsonify({'error': str(e)}), 500
-
 
 @app.route("/api/report-disease-occurrence", methods=['POST'])
 @login_required
@@ -3237,50 +2911,21 @@ def api_report_disease_occurrence():
         db.session.rollback()
         return jsonify({'error': str(e)}), 500
 
-
 if __name__ == '__main__':
-    logger.info("=" * 60)
-    logger.info("Agri-Vision Cotton Analysis System")
-    logger.info("=" * 60)
-    logger.info("Starting Flask application...")
-    logger.info("Open http://localhost:5000 in your browser")
-    logger.info("Endpoints:")
-    logger.info("/              - Home page")
-    logger.info("/analyze       - Upload and analyze image")
-    logger.info("/comparison    - Compare two field images")
-    logger.info("/dashboard     - Multi-farm comparison dashboard")
-    logger.info("/demo          - View demo results")
-    logger.info("/batch         - Batch image analysis")
-    logger.info("/api/analyze   - API endpoint (POST)")
-    logger.info("/health        - Health check")
-    logger.info("=" * 60)
-
-    # Initialize database tables
     with app.app_context():
         db.create_all()
-        logger.info("Database tables created")
 
     ensure_models_loaded()
     
-    # Register models in the registry
     try:
         registry.register_model(
-            model_type="resnet",
-            version="v1.0",
-            path="models/cotton_crop_disease_classification/full_resnet50_model.pth",
-            accuracy=0.9983,
-            dataset_version="v1.0"
+            model_type="resnet", version="v1.0", path="models/cotton_crop_disease_classification/full_resnet50_model.pth", accuracy=0.9983
         )
         registry.register_model(
-            model_type="yolo",
-            version="v1.0",
-            path="models/cotton_crop_growth_stage_prediction/best.pt",
-            accuracy=0.6006,
-            dataset_version="v1.0"
+            model_type="yolo", version="v1.0", path="models/cotton_crop_growth_stage_prediction/best.pt", accuracy=0.6006
         )
         registry.set_active_model("resnet", "v1.0")
         registry.set_active_model("yolo", "v1.0")
-        logger.info("Models registered in model registry")
     except Exception as e:
         logger.error(f"Error registering models: {e}")
     
