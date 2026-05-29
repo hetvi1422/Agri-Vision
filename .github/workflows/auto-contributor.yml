@@ -1,4 +1,4 @@
-name: contributor automation
+name: auto-contributor
 
 on:
   schedule: 
@@ -81,6 +81,7 @@ jobs:
           if git diff --staged --quiet; then
             echo "No changes to README."
           else
-            git commit -m "update contributor list"
+            git commit -m "add contributor profile"
             git push
           fi
+
