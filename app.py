@@ -2235,9 +2235,40 @@ def api_chat_test():
     return jsonify({"status": "ok"})
 
 
+@app.route("/api/chat_test", methods=["GET"])
+def api_chat_test():
+    return jsonify({"status": "ok"})
+
+
 @app.route("/api/chat", methods=["POST"])
 @app.route("/api/chat/", methods=["POST"])
 def api_chat():
+    data = request.get_json(silent=True)
+    if not data or "message" not in data:
+        return jsonify({"reply": "I'm sorry, I didn't receive a message."}), 400
+def api_chat():
+    """
+    Chat with the Agri-Vision Assistant
+    ---
+    tags:
+      - Chatbot
+    parameters:
+      - in: body
+        name: body
+        schema:
+          type: object
+          required:
+            - message
+          properties:
+            message:
+              type: string
+              example: "How much water does my cotton need?"
+    responses:
+      200:
+        description: AI Chatbot response
+      400:
+        description: Missing message payload
+    """
     data = request.get_json(silent=True)
     if not data or "message" not in data:
         return jsonify({"reply": "I'm sorry, I didn't receive a message."}), 400
@@ -2302,6 +2333,33 @@ def api_chat():
 
 @app.route("/api/weather")
 def api_weather():
+    """
+    Get Weather Forecast and Crop Recommendations
+    ---
+    tags:
+      - Weather
+    parameters:
+      - in: query
+        name: lat
+        type: number
+        description: Latitude of the farm
+      - in: query
+        name: lon
+        type: number
+        description: Longitude of the farm
+      - in: query
+        name: city
+        type: string
+        description: City name (fallback if lat/lon not provided)
+    responses:
+      200:
+        description: Current weather data and actionable farming recommendations
+      400:
+        description: Missing location parameters
+      404:
+        description: Could not geocode city
+    """
+
     lat = request.args.get("lat", type=float)
     lon = request.args.get("lon", type=float)
     city = request.args.get("city", type=str)
@@ -2328,6 +2386,28 @@ def api_weather():
 @app.route("/api/analyze", methods=["POST"])
 @limiter.limit("10 per minute")
 def api_analyze():
+    """
+    Analyze Cotton Crop Image
+    ---
+    tags:
+      - Inference
+    consumes:
+      - multipart/form-data
+    parameters:
+      - in: formData
+        name: file
+        type: file
+        required: true
+        description: The cotton crop image to analyze for disease and growth stage
+    responses:
+      200:
+        description: Analysis results including health score, Grad-CAM heatmap, and yield estimate
+      400:
+        description: Invalid file or missing image
+      500:
+        description: AI processing error
+    """
+    
     if "file" not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
 
@@ -2402,38 +2482,6 @@ def api_analyze_stream():
 
     def generate():
         try:
-            yield f"data: {json.dumps({'status': 'uploading', 'progress': 25})}\n\n"
-
-            file_bytes = np.frombuffer(file.read(), np.uint8)
-            image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-            if image is None:
-                yield f"data: {json.dumps({'status': 'error', 'message': 'Unable to process this image. Please upload a clear crop photo and try again.'})}\n\n"
-                return
-
-            yield f"data: {json.dumps({'status': 'analyzing', 'progress': 50})}\n\n"
-
-            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            compressed_rgb = resize_image(image_rgb, MAX_INFERENCE_DIMENSION)
-            yield f"data: {json.dumps({'step': 'upload_received', 'progress': 20, 'message': 'Image received, starting analysis...'})}\n\n"
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(analyze_image, compressed_rgb)
-                try:
-                    results = future.result(timeout=60)
-                except concurrent.futures.TimeoutError:
-                    yield f"data: {json.dumps({'step': 'error', 'progress': 100, 'message': 'The request exceeded the expected processing time. Please try again later.'})}\n\n"
-                    return
-            if results.get("error"):
-                yield f"data: {json.dumps({'status': 'error', 'message': results['error']})}\n\n"
-                return
-
-            yield f"data: {json.dumps({'status': 'generating', 'progress': 75})}\n\n"
-            yield f"data: {json.dumps({'status': 'complete', 'progress': 100, 'results': results})}\n\n"
-        except Exception as e:
-            logger.error(f"Streaming analysis error: {e}")
-            yield f"data: {json.dumps({'status': 'error', 'message': 'Analysis is taking longer than expected. Please try again after some time.'})}\n\n" 
-    def generate():
-        try:
             yield f"data: {json.dumps({'status': 'uploading', 'step': 'upload_received', 'progress': 25, 'message': 'Upload received.'})}\n\n"
 
             file_bytes = np.frombuffer(file.read(), np.uint8)
@@ -2467,7 +2515,6 @@ def api_analyze_stream():
             yield f"data: {json.dumps({'status': 'error', 'step': 'error', 'message': str(e)})}\n\n"
 
     return Response(stream_with_context(generate()), mimetype="text/event-stream")
-
 
 # --- Batch Processing Endpoints ---
 @app.route("/api/batch_upload", methods=["POST"])
